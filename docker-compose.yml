@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-krunchbox}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-krunchbox}
+      POSTGRES_DB: ${POSTGRES_DB:-krunchbox}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Bound to localhost only: for running the tests from the host.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./backend
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-krunchbox}:${POSTGRES_PASSWORD:-krunchbox}@db:5432/${POSTGRES_DB:-krunchbox}
+      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me-before-deploying}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
+      # nginx serves the API under /api and strips the prefix.
+      ROOT_PATH: /api
+      RESERVATION_TTL_MINUTES: ${RESERVATION_TTL_MINUTES:-10}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DEMO_EMAIL: ${DEMO_EMAIL:-}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Bound to localhost only: for the Vite dev server and for debugging.
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      # Healthy once migrations and seeding are done and the API answers.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # The entry point: the web app, which proxies /api to the API.
+      - "8080:8080"
+
+volumes:
+  pgdata:

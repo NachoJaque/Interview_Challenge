@@ -1,0 +1,7 @@
+# Caddy obtains and renews a Let's Encrypt certificate for DOMAIN on its own,
+# and redirects HTTP to HTTPS.
+{$DOMAIN} {
+	encode zstd gzip
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	reverse_proxy frontend:8080
+}

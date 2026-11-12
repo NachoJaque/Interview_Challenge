@@ -1,0 +1,49 @@
+# Production overlay. Use together with the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# (or set COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml in .env)
+#
+# Differences from local: Caddy terminates HTTPS and is the only container
+# reachable from outside; real secrets are mandatory; everything restarts on boot.
+
+services:
+  db:
+    restart: unless-stopped
+    ports: !reset []
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+  api:
+    restart: unless-stopped
+    ports: !reset []
+    environment:
+      ENVIRONMENT: production
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+
+  frontend:
+    restart: unless-stopped
+    ports: !reset []
+    volumes:
+      # Behind Caddy, read the client's address from X-Forwarded-For.
+      - ./frontend/nginx-real-ip.conf:/etc/nginx/conf.d/00-real-ip.conf:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env to the public host name}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
