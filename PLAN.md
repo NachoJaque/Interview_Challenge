@@ -59,10 +59,10 @@ Purchase 1──N Refund 1──N RefundItem N──1 PurchaseItem
   - `held`: entradas reservadas a la espera de confirmación.
   - `sold`: entradas de compras confirmadas.
   - Disponibles = `capacity - held - sold`.
-- Separarlos permite mostrar cuántas están realmente vendidas y cuántas solo apartadas, y liberar las apartadas sin tocar las vendidas.
+- Separarlos permite saber cuántas están realmente vendidas y cuántas solo apartadas, y liberar las apartadas sin tocar las vendidas. Ese desglose solo lo ve el administrador; el público ve las disponibles.
 - **Restricciones en la base de datos:**
   - `CHECK (held >= 0 AND sold >= 0 AND held + sold <= capacity)`: aunque el código tuviera un error, la base de datos rechaza la sobreventa.
-  - `UNIQUE (event_id, name)`: no hay dos "VIP" en el mismo evento.
+  - Índice único sobre `(event_id, lower(name))`: no hay dos "VIP" en el mismo evento, tampoco escritos "vip".
 - `is_refundable` permite tipos sin devolución (por ejemplo, una preventa con descuento).
 
 Alternativas descartadas:
@@ -95,12 +95,13 @@ pending ──confirmar──▶ completed ──reembolso──▶ partially_re
 - `UNIQUE (purchase_id, ticket_type_id)`: un tipo aparece una sola vez por compra.
 
 ### 3.6 `Refund` y `RefundItem`
-`Refund: id, purchase_id, amount, refund_percentage, reason, created_at`
+`Refund: id, purchase_id, amount, refund_percentage, reason, idempotency_key, created_at`
 `RefundItem: id, refund_id, purchase_item_id, quantity, amount`
 
 - Cada reembolso es un **registro inmutable**, no un simple cambio de estado. Da historial y auditoría: cuándo, cuánto, con qué porcentaje.
 - `refund_percentage` guarda la regla aplicada en ese momento (100 o 50), porque la política puede cambiar.
 - `RefundItem` detalla qué entradas se devolvieron, lo que hace posibles varios reembolsos parciales sobre la misma compra.
+- `idempotency_key` con `UNIQUE (purchase_id, idempotency_key)`: reintentar un reembolso no devuelve más entradas.
 
 ### 3.7 Decisiones transversales
 - **Dinero en `NUMERIC(10,2)`** y `Decimal` en Python; nunca `float`.
@@ -128,9 +129,9 @@ Se prefiere a `SELECT ... FOR UPDATE` porque es una sola ida a la base de datos 
 
 ### Confirmar, cancelar y reembolsar
 - Las tres bloquean primero la fila de la compra con `SELECT ... FOR UPDATE` y vuelven a comprobar su estado. Dos peticiones simultáneas sobre la misma compra se procesan en fila.
-- **Confirmar:** mueve las cantidades de `held` a `sold`. Si la reserva ya venció, se libera y se responde `409`.
+- **Confirmar:** mueve las cantidades de `held` a `sold`. Si la reserva ya venció, se libera y se responde `409`. Si el evento ya empezó, se rechaza.
 - **Cancelar:** resta de `held`.
-- **Reembolsar:** valida todo antes de modificar nada; luego incrementa `refunded_quantity`, resta de `sold` y crea el `Refund`.
+- **Reembolsar:** valida todo antes de modificar nada; luego incrementa `refunded_quantity`, resta de `sold` y crea el `Refund`. Con la compra ya bloqueada busca primero un reembolso con la misma clave de idempotencia: un reintento, incluso simultáneo, recibe el original.
 
 ### Vencimiento de reservas
 - Una tarea en segundo plano revisa cada pocos segundos las compras `pending` vencidas, las marca `expired` y devuelve su cupo.
@@ -143,11 +144,13 @@ Se prefiere a `SELECT ... FOR UPDATE` porque es una sola ida a la base de datos 
 1. Requiere sesión iniciada.
 2. El evento debe existir y no haber empezado.
 3. Cada tipo pedido debe pertenecer a ese evento y aparecer una sola vez.
-4. Máximo 10 entradas por compra (configurable).
+4. Máximo 10 entradas por compra y 20 por cliente y evento sumando todas sus compras; las devueltas no cuentan (configurable).
 5. Debe haber cupo para **todos** los tipos pedidos; si falta uno, no se reserva nada.
 6. Una sola reserva pendiente por usuario y evento.
 7. La reserva dura 10 minutos (configurable). Si no se confirma, vence y el cupo vuelve a la venta.
-8. Solo el dueño puede confirmar o cancelar su reserva.
+8. Quien cancela o deja vencer 3 reservas del mismo evento en una hora no puede reservar ese evento hasta que pase la hora (configurable).
+9. No se confirma una reserva si el evento ya empezó.
+10. Solo el dueño puede confirmar o cancelar su reserva.
 
 ### Reembolso
 1. Solo el dueño de la compra puede reembolsarla.
@@ -160,7 +163,7 @@ Se prefiere a `SELECT ... FOR UPDATE` porque es una sola ida a la base de datos 
 5. Los tipos marcados como no reembolsables no se devuelven.
 6. Se puede reembolsar parcialmente: se indica cantidad por ítem.
 7. No se puede devolver más de lo que queda sin reembolsar en cada ítem.
-8. El importe se calcula sobre el precio pagado, no el actual.
+8. El importe se calcula sobre el precio pagado, no el actual. Se redondea al centavo por entrada, así dividir un reembolso en varios paga lo mismo.
 9. Las entradas devueltas vuelven a estar a la venta de inmediato.
 10. Una compra admite varios reembolsos hasta agotarse; su estado pasa a `partially_refunded` o `refunded`.
 
@@ -171,18 +174,18 @@ Se prefiere a `SELECT ... FOR UPDATE` porque es una sola ida a la base de datos 
 | POST | `/auth/register` | público | Crea cuenta |
 | POST | `/auth/login` | público | Devuelve token JWT |
 | GET | `/auth/me` | usuario | Datos de la cuenta |
-| GET | `/events` | público | Eventos con disponibilidad por tipo |
+| GET | `/events` | público | Eventos futuros con disponibilidad por tipo; paginado (`limit`, `offset`, `include_past`) |
 | GET | `/events/{id}` | público | Detalle de un evento |
 | POST | `/events` | admin | Crea evento con sus tipos |
 | POST | `/events/{id}/ticket-types` | admin | Añade un tipo nuevo |
 | **POST** | **`/events/{id}/purchases`** | usuario | **Reserva** entradas (cabecera `Idempotency-Key` opcional) |
 | **POST** | **`/purchases/{id}/confirm`** | usuario | **Confirma la compra** |
 | POST | `/purchases/{id}/cancel` | usuario | Cancela una reserva pendiente |
-| **POST** | **`/purchases/{id}/refunds`** | usuario | **Reembolso** total o parcial |
-| GET | `/purchases` | usuario | Mis compras |
+| **POST** | **`/purchases/{id}/refunds`** | usuario | **Reembolso** total o parcial (cabecera `Idempotency-Key` opcional) |
+| GET | `/purchases` | usuario | Mis compras, paginado |
 | GET | `/purchases/{id}` | usuario | Detalle, con la política de reembolso vigente |
 
-Códigos: `201` creado, `401` sin sesión, `403` sin permiso, `404` no existe, `409` sin cupo, reserva vencida o conflicto, `422` regla de negocio o datos inválidos. Los errores de negocio comparten formato: `{"error": {"code", "message"}}`.
+Códigos: `201` creado, `401` sin sesión, `403` sin permiso, `404` no existe, `409` sin cupo, reserva vencida o conflicto, `422` regla de negocio o datos inválidos, `429` demasiadas reservas abandonadas o demasiadas peticiones. Los errores de negocio comparten formato: `{"error": {"code", "message"}}`.
 
 ## 7. Seguridad
 
@@ -197,8 +200,13 @@ Códigos: `201` creado, `401` sin sesión, `403` sin permiso, `404` no existe, `
 | CSRF | El token viaja en la cabecera `Authorization`, no en una cookie, por lo que otro sitio no puede usarlo |
 | XSS | React escapa todo lo que muestra; cabecera `Content-Security-Policy` estricta en el frontend |
 | Fuerza bruta | Límite de peticiones por IP en login y registro, aplicado en nginx |
+| Abuso de escrituras | nginx limita el resto de escrituras y el tráfico total de la API por IP |
+| Acaparar entradas sin comprar | Una reserva pendiente por cliente y evento, tope de reservas abandonadas y tope de entradas por cliente y evento |
+| Reembolsos duplicados | Reembolso idempotente por clave, serializado por el bloqueo de la compra |
+| Cifras de venta | El desglose reservadas/vendidas solo lo recibe el administrador |
+| Trazabilidad | Registro de auditoría en JSON por operación, con el id de la petición que también recibe el cliente |
 | Clickjacking y similares | Cabeceras `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy` y, en producción, `Strict-Transport-Security` |
-| CORS | Solo los orígenes configurados; en Docker el frontend y la API comparten origen a través de nginx |
+| CORS | Ningún origen permitido por defecto: el frontend y la API comparten origen a través de nginx |
 | Fugas de información | Los errores internos devuelven un mensaje genérico, sin trazas |
 | Secretos | En `.env`, fuera del repositorio; se entrega `.env.example` |
 | Infraestructura | Contenedores sin usuario root; la base de datos no se expone a internet; HTTPS en el deploy |
@@ -209,7 +217,8 @@ Códigos: `201` creado, `401` sin sesión, `403` sin permiso, `404` no existe, `
 ```
 backend/
   app/
-    main.py            # app, CORS, cabeceras, manejadores de error, tarea de vencimiento
+    main.py            # app, id de petición, cabeceras, manejadores de error, tarea de vencimiento
+    audit.py           # registro de auditoría
     config.py          # ajustes por variables de entorno
     database.py        # engine y sesión
     models.py          # modelos SQLAlchemy
@@ -217,7 +226,7 @@ backend/
     security.py        # contraseñas y JWT
     deps.py            # dependencias: sesión, usuario actual, admin
     exceptions.py      # errores de dominio → HTTP
-    seed.py            # datos de ejemplo para la demo
+    seed.py            # cuenta admin y datos de ejemplo para la demo
     routers/           # endpoints delgados: validan, delegan, responden
     services/
       purchases.py     # reservar, confirmar, cancelar, vencer
@@ -241,6 +250,7 @@ Los endpoints no contienen lógica de negocio: la delegan en `services/`. Los se
 5. **Frontend:** registro e inicio de sesión, eventos con disponibilidad que se refresca sola, selección y reserva con cuenta atrás, confirmación, mis compras y reembolso.
 6. **README** en inglés: cómo ejecutar, supuestos, reglas, decisiones de diseño, guion de demo.
 7. **Deploy en Oracle Cloud:** ver sección 10.
+8. **Revisión de código y endurecimiento:** ver sección 11.
 
 ## 10. Deploy en Oracle Cloud
 
@@ -279,7 +289,7 @@ Solo Caddy publica puertos (80 y 443). nginx, la API y la base de datos quedan e
    - Con dominio propio: un registro A apuntando a la máquina.
    - Sin dominio: un subdominio gratuito de DuckDNS.
    Sin HTTPS las contraseñas viajarían en claro, así que no se contempla publicar por HTTP.
-3. **Cómo llega el código.** Repositorio en GitHub; en la máquina, `git clone` y `docker compose up --build`. Actualizar es `git pull` y repetir. Un pipeline de CI/CD sería el siguiente paso natural, pero no aporta al reto.
+3. **Cómo llega el código.** Repositorio en GitHub; en la máquina, `git clone` y `docker compose up --build`. Actualizar es `git pull` y repetir. La integración continua se añadió después (sección 11); el despliegue sigue siendo manual.
 4. **Configuración de producción.** Un archivo `docker-compose.prod.yml` que se superpone al actual:
    - Añade Caddy y quita los puertos publicados de la base de datos, la API y nginx.
    - `ENVIRONMENT=production`: activa HSTS y obliga a un secreto JWT real.
@@ -313,3 +323,37 @@ Yo:
 - **Cupo de A1.** Es habitual que Oracle responda "out of capacity" al crear instancias gratuitas ARM; a veces hay que reintentar o cambiar de zona.
 - **Límites de la capa gratuita.** Conviene confirmarlos en la consola al crear la instancia, porque Oracle los ajusta con el tiempo.
 - **Datos de demo.** Las fechas de los eventos son relativas al momento de la carga inicial; si el deploy se hace días antes de la entrevista, hay que recargar los datos ese día para que las reglas de reembolso se vean como se espera.
+
+## 11. Revisión de código y endurecimiento
+
+Con el sitio ya publicado se revisó el programa completo. No apareció inyección SQL ni forma de sobrevender, pero sí huecos en reglas de negocio y en operación. Esta sección recoge qué se decidió y por qué.
+
+### Reglas de negocio
+
+| Problema | Decisión | Por qué así |
+|----------|----------|-------------|
+| Una cuenta podía reservar, dejar vencer y volver a reservar sin límite, dejando entradas fuera de la venta sin pagar | Tras 3 reservas canceladas o vencidas del mismo evento en una hora, se rechazan las nuevas (`429`) hasta que pase la hora | Se cuenta por cliente **y evento**: quien abandona en un evento puede seguir comprando en otro. Las compras confirmadas no cuentan, así que un cliente real no lo nota |
+| El máximo de 10 entradas era por compra y se evadía con varias compras | Máximo de 20 por cliente y evento, sumando compras confirmadas | Se mantienen los dos límites: 10 acota cada operación, 20 acota al cliente. Las entradas devueltas liberan cupo |
+| Reintentar un reembolso tras un fallo de red devolvía más entradas | `Idempotency-Key` también en el reembolso | La compra ya se bloqueaba durante el reembolso; buscar la clave bajo ese bloqueo resuelve también los reintentos simultáneos, sin manejar errores de unicidad |
+| Redondeo por operación: al 50 %, dividir un reembolso pagaba medio centavo más por entrada | Redondear el importe de **una** entrada y multiplicar | El resultado no depende de cómo se agrupen las entradas |
+| Se podía confirmar una reserva con el evento empezado | Confirmar comprueba la fecha | Coherente con que tampoco se puede reservar |
+| "VIP" y "vip" podían coexistir en un evento | Índice único sobre `lower(name)` | La regla queda en la base de datos, no solo en el código |
+| Se podían crear eventos en el pasado | Validación en el esquema de entrada | |
+
+### API y operación
+
+- **Paginación** en `GET /events` y `GET /purchases`, y eventos pasados ocultos por defecto: cada navegador pide estas listas cada 3 segundos.
+- **Desglose de ventas solo para el administrador.** El público sigue viendo las disponibles y el aforo, que es lo que necesita la barra de disponibilidad. El total ocupado se puede deducir restando; ocultarlo del todo exigiría quitar la barra.
+- **Registro de auditoría** en el log, una línea JSON por operación, con un id de petición generado por el servidor y devuelto en `X-Request-ID`. Se eligió el log y no una tabla: las filas de `purchases` y `refunds` ya son el registro de negocio; el log añade quién lo pidió y en qué petición, sin escribir más en cada transacción.
+- **`/health` consulta la base de datos**, para que Docker no dé por sana una API que no puede atender.
+- **Límites en nginx** para todas las escrituras y para el tráfico total por IP, además del de login.
+- **Datos de demostración opcionales** (`SEED_DEMO_DATA`): activos en local, apagados por defecto en producción. La cuenta de administrador se crea siempre.
+- **CORS cerrado por defecto:** el frontend y la API comparten origen.
+- **Integración continua** en GitHub Actions: linter y formato (`ruff`), tipos (`mypy`), migraciones contra modelos, tests de backend y frontend, y construcción de las imágenes.
+
+### Lo que se dejó como está, y por qué
+
+- **El registro revela si un correo ya existe.** Ocultarlo de verdad exige verificar el correo; sin envío de correos cualquier cambio sería cosmético.
+- **Sin bloqueo por cuenta tras fallos de login.** En un sitio público permitiría a cualquiera dejar fuera al usuario legítimo. Queda el límite por IP.
+- **La documentación de la API sigue pública en producción,** porque los entrevistadores la usan para revisar la solución.
+- **Los límites por cliente se rodean creando más cuentas.** La solución es verificar el correo o un captcha, fuera del alcance del reto.
