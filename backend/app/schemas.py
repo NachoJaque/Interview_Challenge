@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
@@ -60,9 +60,10 @@ class TicketTypeRead(ORMModel):
     name: str
     price: Decimal
     capacity: int
-    held: int
-    sold: int
     available: int
+    # Sales breakdown: null unless the caller is an admin.
+    held: int | None
+    sold: int | None
     is_refundable: bool
 
 
@@ -78,6 +79,8 @@ class EventCreate(RequestModel):
     def require_timezone(cls, v: datetime) -> datetime:
         if v.tzinfo is None:
             raise ValueError("starts_at must include a timezone offset")
+        if v <= datetime.now(UTC):
+            raise ValueError("starts_at must be in the future")
         return v
 
 

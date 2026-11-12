@@ -36,16 +36,24 @@ export function Stepper({
   );
 }
 
-/** Capacity bar: sold, then held (reserved, not yet paid), then free. */
+/**
+ * Capacity bar. Admins get the breakdown (sold, then reserved but not yet
+ * paid, then free); everyone else sees only how much is taken.
+ */
 export function AvailabilityBar({ ticketType }: { ticketType: TicketType }) {
-  const percent = (count: number) => (ticketType.capacity === 0 ? 0 : (count / ticketType.capacity) * 100);
+  const { capacity, available, held, sold } = ticketType;
+  const percent = (count: number) => (capacity === 0 ? 0 : (count / capacity) * 100);
+  if (held === null || sold === null) {
+    return (
+      <div className="bar" title={`${available} of ${capacity} available`}>
+        <span className="bar-sold" style={{ width: `${percent(capacity - available)}%` }} />
+      </div>
+    );
+  }
   return (
-    <div
-      className="bar"
-      title={`${ticketType.sold} sold · ${ticketType.held} reserved · ${ticketType.available} available`}
-    >
-      <span className="bar-sold" style={{ width: `${percent(ticketType.sold)}%` }} />
-      <span className="bar-held" style={{ width: `${percent(ticketType.held)}%` }} />
+    <div className="bar" title={`${sold} sold · ${held} reserved · ${available} available`}>
+      <span className="bar-sold" style={{ width: `${percent(sold)}%` }} />
+      <span className="bar-held" style={{ width: `${percent(held)}%` }} />
     </div>
   );
 }

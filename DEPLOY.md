@@ -83,7 +83,8 @@ Set these values in `.env`:
 | `ENVIRONMENT` | `production` |
 | `JWT_SECRET` | Output of `openssl rand -base64 48` |
 | `POSTGRES_PASSWORD` | Output of `openssl rand -hex 24` |
-| `ADMIN_PASSWORD`, `DEMO_PASSWORD` | Passwords of your choice for the two seeded accounts |
+| `ADMIN_PASSWORD`, `DEMO_PASSWORD` | Passwords of your choice for the two seeded accounts. Never keep the values from `.env.example`: they are public |
+| `SEED_DEMO_DATA` | `true` for a demo site (demo customer and demo events). Leave it out for a real deployment, which then starts with only the admin account |
 
 `COMPOSE_FILE` makes every `docker compose` command below use the production overlay.
 
@@ -95,7 +96,7 @@ The API refuses to start in production with the default `JWT_SECRET`.
 docker compose up -d --build
 ```
 
-The first start builds the images, applies the migrations, loads the demo data and obtains the certificate. After a minute or two the site is live at `https://<DOMAIN>`.
+The first start builds the images, applies the migrations, creates the admin account (plus the demo data if `SEED_DEMO_DATA=true`) and obtains the certificate. After a minute or two the site is live at `https://<DOMAIN>`.
 
 ```bash
 docker compose ps
@@ -120,7 +121,7 @@ Update to the latest code:
 git pull && docker compose up -d --build
 ```
 
-Reset the demo data (deletes every account and purchase, then seeds again):
+Reset the demo data (deletes every account and purchase, then seeds again; needs `SEED_DEMO_DATA=true` in `.env`):
 
 ```bash
 docker compose down -v && docker compose up -d --build
@@ -132,6 +133,12 @@ Logs:
 
 ```bash
 docker compose logs -f api
+```
+
+The audit trail (one JSON line per reservation, confirmation, refund, login…):
+
+```bash
+docker compose logs api | grep " audit "
 ```
 
 ## Troubleshooting

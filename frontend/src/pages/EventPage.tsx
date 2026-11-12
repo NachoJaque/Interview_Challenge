@@ -104,7 +104,7 @@ export function EventPage() {
                       {!tt.is_refundable && <span className="tag">Non-refundable</span>}
                       <div className={tt.available === 0 ? "sold-out" : "muted"}>
                         {tt.available === 0 ? "Sold out" : `${tt.available} of ${tt.capacity} left`}
-                        {tt.held > 0 && ` · ${tt.held} reserved by buyers right now`}
+                        {tt.held !== null && tt.held > 0 && ` · ${tt.held} reserved by buyers right now`}
                       </div>
                     </div>
                     <span>{money(tt.price)}</span>
@@ -139,7 +139,7 @@ export function EventPage() {
             )}
           </div>
           <p className="muted small">
-            Up to {MAX_TICKETS_PER_PURCHASE} tickets per purchase. Reserving holds your tickets for a few minutes
+            Up to {MAX_TICKETS_PER_PURCHASE} tickets per purchase and 20 per customer for each event. Reserving holds your tickets for a few minutes
             while you confirm.
           </p>
         </section>

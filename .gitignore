@@ -6,3 +6,7 @@ __pycache__/
 node_modules/
 dist/
 .claude/
+
+# Personal presentation notes
+MANUAL.md
+MANUAL.en.md

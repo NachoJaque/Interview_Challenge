@@ -20,6 +20,8 @@ services:
     environment:
       ENVIRONMENT: production
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      # A real deployment starts empty; set SEED_DEMO_DATA=true for a demo site.
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-false}
 
   frontend:
     restart: unless-stopped

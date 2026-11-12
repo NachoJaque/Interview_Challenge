@@ -32,7 +32,9 @@ def test_register_login_and_read_profile(client):
 
 
 def test_passwords_are_stored_hashed(client, db):
-    client.post("/auth/register", json={"email": "ana@example.com", "full_name": "Ana", "password": "a-strong-password"})
+    client.post(
+        "/auth/register", json={"email": "ana@example.com", "full_name": "Ana", "password": "a-strong-password"}
+    )
 
     stored = db.scalar(select(User.hashed_password).where(User.email == "ana@example.com"))
 
@@ -186,10 +188,8 @@ def test_reserve_confirm_and_partially_refund(client, user, make_event):
     assert purchase["refund_policy"]["allowed"] is False  # nothing to refund until confirmed
 
     listed = client.get(f"/events/{event.id}").json()
-    assert {tt["name"]: (tt["held"], tt["sold"], tt["available"]) for tt in listed["ticket_types"]} == {
-        "General": (3, 0, 97),
-        "VIP": (1, 0, 9),
-    }
+    assert {tt["name"]: tt["available"] for tt in listed["ticket_types"]} == {"General": 97, "VIP": 9}
+    assert (counters(general.id), counters(vip.id)) == ((3, 0), (1, 0))
 
     confirmed = client.post(f"/purchases/{purchase['id']}/confirm", headers=headers)
     assert confirmed.status_code == 200

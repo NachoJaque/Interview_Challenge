@@ -1,17 +1,26 @@
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from app.audit import request_id_var
 from app.config import get_settings
 from app.database import SessionLocal
+from app.deps import DbSession
 from app.exceptions import DomainError, domain_error_handler
 from app.routers import auth, events, purchases
 from app.services.purchases import release_expired_purchases
+
+# uvicorn only configures its own loggers; without this the application's
+# INFO lines (the audit trail, the sweeper) would be dropped.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -49,23 +58,32 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Krunchbox Ticketing API",
     description="Sell and refund event tickets without ever overselling.",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
-    root_path=settings.root_path,
     redoc_url=None,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
-)
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
+        expose_headers=["X-Request-ID"],
+    )
 
 
 @app.middleware("http")
-async def security_headers(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-    response = await call_next(request)
+async def request_context(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    """Tag the request with an id (always generated here, never taken from the
+    client) and add the security headers to its response."""
+    request_id = uuid.uuid4().hex
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = request_id
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -84,5 +102,13 @@ app.include_router(purchases.router)
 
 
 @app.get("/health", tags=["health"])
-def health() -> dict[str, str]:
+def health(db: DbSession, response: Response) -> dict[str, str]:
+    """Ready only if the database answers, so a load balancer or Docker stops
+    sending traffic to an instance that cannot serve it."""
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        logger.exception("Health check could not reach the database")
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "unavailable"}
     return {"status": "ok"}

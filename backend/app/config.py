@@ -17,13 +17,21 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60
 
-    cors_origins: list[str] = ["http://localhost:5173"]
+    # Browser origins allowed to call the API directly. Empty by default: the
+    # web app reaches the API through its own origin (nginx or the Vite proxy).
+    cors_origins: list[str] = []
     # Path prefix a reverse proxy strips before forwarding (e.g. "/api"), so
     # the interactive docs generate correct URLs when served behind it.
     root_path: str = ""
 
     # Purchase rules
     max_tickets_per_purchase: int = 10
+    # Tickets one customer may hold for one event across all their purchases.
+    max_tickets_per_user_per_event: int = 20
+    # Reservations a customer may let expire or cancel for one event within the
+    # window before new ones are refused (stops holding tickets without buying).
+    max_abandoned_reservations: int = 3
+    abandoned_reservation_window_minutes: int = 60
     reservation_ttl_minutes: int = 10
     # How often the background task releases expired reservations (0 disables it).
     reservation_sweep_seconds: int = 10
@@ -32,6 +40,9 @@ class Settings(BaseSettings):
     full_refund_min_hours: int = 7 * 24  # this long or more before the event: 100%
     partial_refund_min_hours: int = 48  # this long or more before the event: partial_refund_percentage
     partial_refund_percentage: int = 50
+
+    # Whether the seed script also loads the demo customer and demo events.
+    seed_demo_data: bool = True
 
     # Accounts created by the seed script (python -m app.seed)
     admin_email: str | None = None

@@ -12,6 +12,13 @@ export function timeUntil(iso: string): string {
   return `starts in ${Math.floor(hours / 24)} days`;
 }
 
+/** Refund for one ticket, rounded half-up to the cent (same rule as the API). */
+export function refundPerTicket(unitPrice: string | number, percentage: number): number {
+  // Work in whole numbers (price in cents x percentage) to avoid float drift.
+  const scaled = Math.round(Number(unitPrice) * 100) * percentage;
+  return Math.floor((scaled + 50) / 100) / 100;
+}
+
 export function clock(totalSeconds: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;

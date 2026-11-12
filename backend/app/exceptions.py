@@ -39,6 +39,15 @@ class InvalidPurchaseStateError(ConflictError):
     code = "invalid_purchase_state"
 
 
+class TooManyReservationsError(DomainError):
+    status_code = status.HTTP_429_TOO_MANY_REQUESTS
+    code = "too_many_reservations"
+
+
+class TicketLimitExceededError(DomainError):
+    code = "ticket_limit_exceeded"
+
+
 class SalesClosedError(DomainError):
     code = "sales_closed"
 

@@ -111,9 +111,7 @@ def test_concurrent_confirmations_sell_the_tickets_once(db, user, make_event, se
         db, user, event.id, PurchaseRequest(items=[{"ticket_type_id": general.id, "quantity": 3}]), settings
     )
 
-    results = run_concurrently(
-        [lambda session: confirm_purchase(session, session.get(User, user.id), purchase.id)] * 8
-    )
+    results = run_concurrently([lambda session: confirm_purchase(session, session.get(User, user.id), purchase.id)] * 8)
 
     assert results == {"ok": 8}
     assert counters(general.id) == (0, 3)

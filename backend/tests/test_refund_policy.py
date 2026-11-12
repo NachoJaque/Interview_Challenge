@@ -31,7 +31,9 @@ def test_refund_window(time_left: timedelta, allowed: bool, percentage: int) -> 
 
 
 def test_refund_window_is_configurable() -> None:
-    lenient = Settings(_env_file=None, full_refund_min_hours=24, partial_refund_min_hours=2, partial_refund_percentage=80)
+    lenient = Settings(
+        _env_file=None, full_refund_min_hours=24, partial_refund_min_hours=2, partial_refund_percentage=80
+    )
 
     assert evaluate_refund_window(NOW + timedelta(hours=30), NOW, lenient).percentage == 100
     assert evaluate_refund_window(NOW + timedelta(hours=3), NOW, lenient).percentage == 80

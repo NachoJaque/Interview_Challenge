@@ -42,7 +42,9 @@ python -m venv .venv
 .venv/bin/pytest                                 # Windows: .venv\Scripts\pytest
 ```
 
-80 tests, including concurrency tests that fire simultaneous requests from real threads. They use a separate `krunchbox_test` database, created automatically.
+102 tests, including concurrency tests that fire simultaneous requests from real threads. They use a separate `krunchbox_test` database, created automatically.
+
+The same checks run on every push in [GitHub Actions](.github/workflows/ci.yml): `ruff` (lint and format), `mypy`, a check that the migrations match the models, the backend tests, the frontend unit tests (`npm test`) and the Docker build.
 
 ## Where to look first
 
@@ -125,7 +127,7 @@ Around that core:
 - **Confirm, cancel and refund** start with `SELECT ... FOR UPDATE` on the purchase and re-check its state, so duplicate or simultaneous requests are processed one at a time. Refunding the same ticket twice is impossible.
 - **Expiry.** A background task releases unconfirmed reservations every 10 seconds using `FOR UPDATE SKIP LOCKED`, so it is safe with several API instances and never fights a confirmation in progress. Reserving also reclaims stale holds for that event first, so availability does not depend on the task having run.
 - **Database constraints as the last line of defence.** Even if application code were wrong, `CHECK (held >= 0 AND sold >= 0 AND held + sold <= capacity)` rejects an oversell.
-- **Idempotency.** `POST /events/{id}/purchases` accepts an `Idempotency-Key` header; a retry returns the original reservation instead of creating a second one.
+- **Idempotency.** Reserving and refunding both accept an `Idempotency-Key` header; a retry after a lost response returns the original result instead of holding or refunding tickets a second time.
 
 ## Business rules
 
@@ -134,11 +136,13 @@ Around that core:
 1. The customer must be logged in.
 2. The event must not have started.
 3. Each ticket type must belong to the event and appear once per purchase.
-4. At most 10 tickets per purchase.
+4. At most 10 tickets per purchase, and 20 per customer for one event across all their purchases (refunded tickets do not count).
 5. There must be capacity for every requested type; otherwise nothing is reserved.
 6. One pending reservation per customer and event.
 7. A reservation lasts 10 minutes; unconfirmed tickets return to sale.
-8. Only the owner can confirm or cancel a reservation.
+8. A customer who cancels or lets expire 3 reservations for one event within an hour cannot reserve for it again until the hour has passed. Without this, one account could keep tickets off sale indefinitely without buying.
+9. A reservation cannot be confirmed once the event has started.
+10. Only the owner can confirm or cancel a reservation.
 
 ### Refund rules
 
@@ -156,7 +160,7 @@ Around that core:
 5. Ticket types marked non-refundable cannot be refunded.
 6. Partial refunds are allowed: the request states a quantity per purchase item.
 7. A customer cannot refund more tickets than remain un-refunded on an item.
-8. The amount is based on the price paid, not the current price.
+8. The amount is based on the price paid, not the current price. It is rounded to the cent per ticket, so refunding tickets one at a time or together pays exactly the same.
 9. Refunded tickets go back on sale immediately.
 10. A purchase can be refunded several times until nothing is left; its status becomes `partially_refunded` and then `refunded`.
 11. If any line of a refund request is invalid, the whole request is rejected.
@@ -170,7 +174,7 @@ Limits, time windows and the percentage are settings ([backend/app/config.py](ba
 | POST | `/auth/register` | public | Create an account |
 | POST | `/auth/login` | public | Get a JWT |
 | GET | `/auth/me` | user | Current account |
-| GET | `/events` | public | Events with live availability per ticket type |
+| GET | `/events` | public | Upcoming events with live availability per ticket type (`limit`, `offset`, `include_past`) |
 | GET | `/events/{id}` | public | One event |
 | POST | `/events` | admin | Create an event with its ticket types |
 | POST | `/events/{id}/ticket-types` | admin | Add a ticket type to an event |
@@ -178,7 +182,7 @@ Limits, time windows and the percentage are settings ([backend/app/config.py](ba
 | **POST** | **`/purchases/{id}/confirm`** | user | **Complete the purchase** |
 | POST | `/purchases/{id}/cancel` | user | Release a pending reservation |
 | **POST** | **`/purchases/{id}/refunds`** | user | **Refund all or some tickets** |
-| GET | `/purchases` | user | My purchases |
+| GET | `/purchases` | user | My purchases, newest first (`limit`, `offset`) |
 | GET | `/purchases/{id}` | user | One purchase, with the refund it would get right now |
 
 Business errors share one shape, with a stable code for clients:
@@ -187,13 +191,18 @@ Business errors share one shape, with a stable code for clients:
 { "error": { "code": "insufficient_capacity", "message": "Not enough 'VIP' tickets available for 2 ticket(s)." } }
 ```
 
-`401` not logged in · `403` not allowed · `404` not found · `409` sold out, expired reservation or conflict · `422` business rule or invalid input.
+`401` not logged in · `403` not allowed · `404` not found · `409` sold out, expired reservation or conflict · `422` business rule or invalid input · `429` too many abandoned reservations or too many requests.
+
+Everyone sees how many tickets are available. The split of the rest into reserved (`held`) and `sold` is the venue's sales data: those two fields are `null` unless the caller is an admin.
+
+Every response carries an `X-Request-ID`. The same id is written with each line of the audit log (reservations, confirmations, cancellations, expiries, refunds, logins, admin changes), so a response can be traced to what happened on the server.
 
 ## Code structure
 
 ```
 backend/app/
-  main.py            app, CORS, security headers, error handlers, expiry task
+  main.py            app, request ids, security headers, error handlers, expiry task
+  audit.py           audit log: one JSON line per business event
   models.py          SQLAlchemy models
   schemas.py         request and response schemas
   routers/           thin endpoints: validate, delegate, respond
@@ -201,7 +210,7 @@ backend/app/
   exceptions.py      domain errors, mapped to HTTP in one place
   security.py        password hashing and JWT
   deps.py            database session, current user, admin check
-  seed.py            demo data
+  seed.py            admin account and demo data
 ```
 
 ```
@@ -227,9 +236,14 @@ Endpoints contain no business logic. They call a service function, which raises 
 | CSRF | The token travels in the `Authorization` header, not a cookie, so another site cannot use it |
 | XSS | React escapes everything it renders; a strict `Content-Security-Policy` allows scripts and styles only from the app's own origin |
 | Brute force | nginx limits login and sign-up to 20 requests per minute per IP, answering `429` beyond that |
+| Abuse of writes | nginx limits every other write to 60 per minute per IP, and all API traffic to 20 requests per second per IP |
+| Holding tickets without buying | One pending reservation per customer and event, a cap on abandoned reservations, and a cap on tickets per customer and event |
+| Duplicate refunds | Refunds are idempotent by key and serialized by a row lock on the purchase |
+| Sales data | Only admins see the reserved/sold breakdown of each ticket type |
+| Traceability | A JSON audit log line per business event, tied to the request id returned to the client |
 | Token theft | The token is kept in `sessionStorage`: it is scoped to one tab and gone when the tab closes |
 | Clickjacking, MIME sniffing | `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`; `Strict-Transport-Security` in production |
-| Cross-origin access | CORS limited to configured origins; in Docker the app and the API share one origin through nginx |
+| Cross-origin access | No origin is allowed by default: the app and the API share one origin through nginx. `CORS_ORIGINS` can allow others |
 | Information leaks | Internal errors return a generic message; account responses are never cached |
 | Secrets | Read from the environment; `.env` is git-ignored |
 | Transport | In production Caddy serves HTTPS only, with automatic certificates, HTTP redirected and HSTS |
@@ -252,6 +266,8 @@ Event dates are relative to the moment the database is seeded, so each rule can 
 To watch a reservation expire, set `RESERVATION_TTL_MINUTES=1` in `.env` and restart the API.
 
 To reset the demo data: `docker compose down -v` and start again.
+
+The demo customer and events are loaded when `SEED_DEMO_DATA` is true, which is the default locally. The production overlay defaults to false, so a real deployment starts with only the admin account.
 
 ## Deployment
 

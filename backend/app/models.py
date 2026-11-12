@@ -27,7 +27,7 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class PurchaseStatus(str, enum.Enum):
+class PurchaseStatus(enum.StrEnum):
     PENDING = "pending"  # tickets are held, waiting for confirmation
     COMPLETED = "completed"
     CANCELLED = "cancelled"  # reservation released by the user
@@ -78,7 +78,8 @@ class TicketType(Base):
 
     __tablename__ = "ticket_types"
     __table_args__ = (
-        UniqueConstraint("event_id", "name", name="uq_ticket_types_event_name"),
+        # Case-insensitive: "VIP" and "vip" are the same category.
+        Index("uq_ticket_types_event_name", "event_id", text("lower(name)"), unique=True),
         CheckConstraint("capacity >= 0", name="ck_ticket_types_capacity_non_negative"),
         CheckConstraint(
             "held >= 0 AND sold >= 0 AND held + sold <= capacity",
@@ -195,10 +196,9 @@ class Refund(Base):
 
     __tablename__ = "refunds"
     __table_args__ = (
+        UniqueConstraint("purchase_id", "idempotency_key", name="uq_refunds_purchase_idempotency_key"),
         CheckConstraint("amount >= 0", name="ck_refunds_amount_non_negative"),
-        CheckConstraint(
-            "refund_percentage > 0 AND refund_percentage <= 100", name="ck_refunds_percentage_range"
-        ),
+        CheckConstraint("refund_percentage > 0 AND refund_percentage <= 100", name="ck_refunds_percentage_range"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -207,6 +207,7 @@ class Refund(Base):
     # The policy tier applied when the refund was made (policy can change later).
     refund_percentage: Mapped[int] = mapped_column(Integer)
     reason: Mapped[str | None] = mapped_column(String(500))
+    idempotency_key: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     purchase: Mapped[Purchase] = relationship(back_populates="refunds")

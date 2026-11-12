@@ -1,4 +1,8 @@
-"""Demo data: `python -m app.seed`. Safe to run more than once.
+"""Initial data: `python -m app.seed`. Safe to run more than once.
+
+Always creates the admin account (when ADMIN_EMAIL and ADMIN_PASSWORD are
+set). The demo customer and demo events are loaded only when SEED_DEMO_DATA
+is true, so a real deployment starts empty.
 
 Each event is dated relative to "now" so that every refund rule can be shown
 live: full refund, partial refund, refunds closed, a non-refundable ticket
@@ -77,6 +81,9 @@ def main() -> None:
     settings = get_settings()
     with SessionLocal() as db:
         _ensure_user(db, settings.admin_email, settings.admin_password, "Venue Admin", is_admin=True)
+        if not settings.seed_demo_data:
+            db.commit()
+            return
         _ensure_user(db, settings.demo_email, settings.demo_password, "Demo Customer", is_admin=False)
         if db.scalar(select(Event.id).limit(1)) is None:
             events = _demo_events(datetime.now(UTC))

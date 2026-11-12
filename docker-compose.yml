@@ -26,6 +26,8 @@ services:
       # nginx serves the API under /api and strips the prefix.
       ROOT_PATH: /api
       RESERVATION_TTL_MINUTES: ${RESERVATION_TTL_MINUTES:-10}
+      # Demo customer and demo events. On by default locally.
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       DEMO_EMAIL: ${DEMO_EMAIL:-}

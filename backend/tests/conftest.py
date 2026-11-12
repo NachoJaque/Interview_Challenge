@@ -18,6 +18,7 @@ TEST_DATABASE_URL = os.environ.get(
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["RESERVATION_SWEEP_SECONDS"] = "0"  # tests trigger the sweeper explicitly
 os.environ["ENVIRONMENT"] = "test"
+os.environ["CORS_ORIGINS"] = '["http://localhost:5173"]'  # off by default; on to test the allow-list
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -119,9 +120,7 @@ def make_event(db: Session) -> Callable[..., Event]:
             starts_at=datetime.now(UTC) + starts_in,
             ticket_types=[
                 TicketType(name="General", price=Decimal("50.00"), capacity=general_capacity),
-                TicketType(
-                    name="VIP", price=Decimal("150.00"), capacity=vip_capacity, is_refundable=vip_refundable
-                ),
+                TicketType(name="VIP", price=Decimal("150.00"), capacity=vip_capacity, is_refundable=vip_refundable),
             ],
         )
         db.add(event)

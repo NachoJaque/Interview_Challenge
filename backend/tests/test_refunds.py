@@ -23,9 +23,7 @@ def buy(db, settings):
 
     def _buy(user, event, **quantities: int) -> Purchase:
         request = PurchaseRequest(
-            items=[
-                {"ticket_type_id": ticket_type(event, name).id, "quantity": qty} for name, qty in quantities.items()
-            ]
+            items=[{"ticket_type_id": ticket_type(event, name).id, "quantity": qty} for name, qty in quantities.items()]
         )
         purchase, _ = reserve_tickets(db, user, event.id, request, settings)
         return confirm_purchase(db, user, purchase.id)
@@ -45,7 +43,7 @@ def test_full_refund_more_than_seven_days_before_the_event(db, user, make_event,
     purchase = buy(user, event, General=2)
     general = ticket_type(event, "General")
 
-    refund = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 2)), settings)
+    refund, _ = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 2)), settings)
 
     assert refund.refund_percentage == 100
     assert refund.amount == Decimal("100.00")
@@ -57,7 +55,7 @@ def test_half_refund_between_48_hours_and_seven_days_before_the_event(db, user, 
     event = make_event(starts_in=timedelta(days=4))
     purchase = buy(user, event, VIP=1)
 
-    refund = create_refund(db, user, purchase.id, refund_of((item(purchase, "VIP").id, 1)), settings)
+    refund, _ = create_refund(db, user, purchase.id, refund_of((item(purchase, "VIP").id, 1)), settings)
 
     assert refund.refund_percentage == 50
     assert refund.amount == Decimal("75.00")
@@ -89,7 +87,7 @@ def test_refund_uses_the_price_paid_not_the_current_price(db, user, make_event, 
     ticket_type(event, "General").price = Decimal("500.00")
     db.commit()
 
-    refund = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 1)), settings)
+    refund, _ = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 1)), settings)
 
     assert refund.amount == Decimal("50.00")
 
@@ -102,7 +100,7 @@ def test_partial_refund_releases_only_the_refunded_tickets(db, user, make_event,
     purchase = buy(user, event, General=5)
     general = ticket_type(event, "General")
 
-    refund = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 2)), settings)
+    refund, _ = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 2)), settings)
 
     assert refund.amount == Decimal("100.00")
     assert purchase.status == PurchaseStatus.PARTIALLY_REFUNDED
@@ -132,7 +130,7 @@ def test_one_refund_can_cover_several_ticket_types(db, user, make_event, setting
     event = make_event()
     purchase = buy(user, event, General=2, VIP=2)
 
-    refund = create_refund(
+    refund, _ = create_refund(
         db,
         user,
         purchase.id,
@@ -178,7 +176,7 @@ def test_non_refundable_ticket_types_are_rejected(db, user, make_event, settings
         create_refund(db, user, purchase.id, refund_of((item(purchase, "VIP").id, 1)), settings)
 
     # The refundable ticket in the same purchase is unaffected.
-    refund = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 1)), settings)
+    refund, _ = create_refund(db, user, purchase.id, refund_of((item(purchase, "General").id, 1)), settings)
     assert refund.amount == Decimal("50.00")
 
 

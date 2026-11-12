@@ -1,8 +1,8 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import { api, type Purchase } from "../api";
+import { api, ApiError, type Purchase } from "../api";
 import { ErrorBanner, PendingCheckout, StatusBadge, Stepper } from "../components";
-import { formatDate, money } from "../format";
+import { formatDate, money, refundPerTicket } from "../format";
 import { usePolling } from "../hooks";
 import { REFRESH_MS } from "./EventsPage";
 
@@ -129,12 +129,15 @@ function RefundForm({
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // One key per refund attempt: retrying after a lost response never refunds twice.
+  const idempotencyKey = useRef(crypto.randomUUID());
 
   const percentage = purchase.refund_policy.percentage;
   const totalQuantity = Object.values(quantities).reduce((sum, quantity) => sum + quantity, 0);
-  // An estimate for display only: the API calculates the amount actually refunded.
+  // For display only: the API calculates the amount actually refunded. Like
+  // the API, it rounds the refund of one ticket to the cent, then multiplies.
   const estimate = purchase.items.reduce(
-    (sum, item) => sum + (Number(item.unit_price) * (quantities[item.id] ?? 0) * percentage) / 100,
+    (sum, item) => sum + refundPerTicket(item.unit_price, percentage) * (quantities[item.id] ?? 0),
     0,
   );
 
@@ -146,9 +149,12 @@ function RefundForm({
       const items = Object.entries(quantities)
         .filter(([, quantity]) => quantity > 0)
         .map(([id, quantity]) => ({ purchase_item_id: Number(id), quantity }));
-      await api.refund(purchase.id, items, reason);
+      await api.refund(purchase.id, items, reason, idempotencyKey.current);
       onDone();
     } catch (err) {
+      // A rejected request refunded nothing, so the next attempt is a new one;
+      // after a network failure the key is kept, which makes the retry safe.
+      if (err instanceof ApiError && err.status !== 0) idempotencyKey.current = crypto.randomUUID();
       setError(err instanceof Error ? err.message : "Could not process the refund");
       setBusy(false);
     }

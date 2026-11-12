@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Response, status
+from fastapi import APIRouter, Header, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -28,7 +28,7 @@ IdempotencyKey = Annotated[
         min_length=8,
         max_length=100,
         description="Optional client-generated key. Retrying with the same key returns the "
-        "original reservation instead of creating a second one.",
+        "original result instead of reserving or refunding a second time.",
     ),
 ]
 
@@ -105,23 +105,40 @@ def cancel_purchase(purchase_id: ResourceId, db: DbSession, user: CurrentUser, s
 
 @router.post("/purchases/{purchase_id}/refunds", response_model=PurchaseRead, status_code=status.HTTP_201_CREATED)
 def refund_tickets(
-    purchase_id: ResourceId, payload: RefundRequest, db: DbSession, user: CurrentUser, settings: AppSettings
+    purchase_id: ResourceId,
+    payload: RefundRequest,
+    response: Response,
+    db: DbSession,
+    user: CurrentUser,
+    settings: AppSettings,
+    idempotency_key: IdempotencyKey = None,
 ) -> PurchaseRead:
     """Refund some or all tickets of a confirmed purchase (see README "Refund rules").
 
     Refunded tickets go back on sale immediately. Returns the updated purchase.
     """
-    refund = refund_service.create_refund(db, user, purchase_id, payload, settings)
+    refund, created = refund_service.create_refund(db, user, purchase_id, payload, settings, idempotency_key)
+    if not created:
+        response.status_code = status.HTTP_200_OK
     return _to_read(refund.purchase, settings)
 
 
 @router.get("/purchases", response_model=list[PurchaseRead])
-def list_my_purchases(db: DbSession, user: CurrentUser, settings: AppSettings) -> list[PurchaseRead]:
+def list_my_purchases(
+    db: DbSession,
+    user: CurrentUser,
+    settings: AppSettings,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0, le=100_000)] = 0,
+) -> list[PurchaseRead]:
+    """The caller's purchases, newest first."""
     purchases = db.scalars(
         select(Purchase)
         .where(Purchase.user_id == user.id)
         .options(*_purchase_loading)
         .order_by(Purchase.created_at.desc(), Purchase.id.desc())
+        .limit(limit)
+        .offset(offset)
     )
     return [_to_read(p, settings) for p in purchases]
 
@@ -129,9 +146,7 @@ def list_my_purchases(db: DbSession, user: CurrentUser, settings: AppSettings) -
 @router.get("/purchases/{purchase_id}", response_model=PurchaseRead)
 def get_my_purchase(purchase_id: ResourceId, db: DbSession, user: CurrentUser, settings: AppSettings) -> PurchaseRead:
     purchase = db.scalar(
-        select(Purchase)
-        .where(Purchase.id == purchase_id, Purchase.user_id == user.id)
-        .options(*_purchase_loading)
+        select(Purchase).where(Purchase.id == purchase_id, Purchase.user_id == user.id).options(*_purchase_loading)
     )
     if purchase is None:
         raise NotFoundError(f"Purchase {purchase_id} not found.")

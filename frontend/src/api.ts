@@ -13,9 +13,10 @@ export interface TicketType {
   name: string;
   price: string;
   capacity: number;
-  held: number;
-  sold: number;
   available: number;
+  /** Sales breakdown: null unless the logged-in user is an admin. */
+  held: number | null;
+  sold: number | null;
   is_refundable: boolean;
 }
 
@@ -92,8 +93,7 @@ export const getToken = () => sessionStorage.getItem(TOKEN_KEY);
 export const setToken = (token: string) => sessionStorage.setItem(TOKEN_KEY, token);
 export const clearToken = () => sessionStorage.removeItem(TOKEN_KEY);
 
-function errorMessage(status: number, body: unknown): { message: string; code?: string } {
-  if (status === 429) return { message: "Too many attempts. Please wait a minute and try again." };
+export function errorMessage(status: number, body: unknown): { message: string; code?: string } {
   if (body && typeof body === "object") {
     const { error, detail } = body as {
       error?: { code: string; message: string };
@@ -106,6 +106,8 @@ function errorMessage(status: number, body: unknown): { message: string; code?: 
       return { message: field ? `${field}: ${detail[0].msg}` : detail[0].msg };
     }
   }
+  // 429 without a body comes from the web server's rate limit.
+  if (status === 429) return { message: "Too many attempts. Please wait a minute and try again." };
   return { message: "Something went wrong. Please try again." };
 }
 
@@ -161,13 +163,22 @@ export const api = {
   ) => postJson<TicketType>(`/events/${eventId}/ticket-types`, ticketType),
 
   // The idempotency key makes a retry after a network failure return the same
-  // reservation instead of holding the tickets twice.
+  // reservation (or refund) instead of holding or refunding the tickets twice.
   reserve: (eventId: number, items: { ticket_type_id: number; quantity: number }[], idempotencyKey: string) =>
     postJson<Purchase>(`/events/${eventId}/purchases`, { items }, { "Idempotency-Key": idempotencyKey }),
 
   purchases: () => request<Purchase[]>("/purchases"),
   confirm: (purchaseId: number) => postJson<Purchase>(`/purchases/${purchaseId}/confirm`),
   cancel: (purchaseId: number) => postJson<Purchase>(`/purchases/${purchaseId}/cancel`),
-  refund: (purchaseId: number, items: { purchase_item_id: number; quantity: number }[], reason: string) =>
-    postJson<Purchase>(`/purchases/${purchaseId}/refunds`, { items, reason: reason.trim() || null }),
+  refund: (
+    purchaseId: number,
+    items: { purchase_item_id: number; quantity: number }[],
+    reason: string,
+    idempotencyKey: string,
+  ) =>
+    postJson<Purchase>(
+      `/purchases/${purchaseId}/refunds`,
+      { items, reason: reason.trim() || null },
+      { "Idempotency-Key": idempotencyKey },
+    ),
 };
