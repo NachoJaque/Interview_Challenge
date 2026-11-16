@@ -18,6 +18,7 @@ from app.database import SessionLocal
 from app.deps import DbSession
 from app.exceptions import register_error_handlers
 from app.routers import auth, events, purchases
+from app.schemas import ErrorResponse
 from app.services.purchases import release_expired_purchases
 
 # uvicorn only configures its own loggers; without this the application's
@@ -63,9 +64,14 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="Krunchbox Ticketing API",
     description="Sell and refund event tickets without ever overselling.",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
     redoc_url=None,
+    # Shown in the interactive docs for every endpoint; see exceptions.py.
+    responses={
+        422: {"model": ErrorResponse, "description": "A business rule was broken, or the input is invalid."},
+        503: {"model": ErrorResponse, "description": "Over capacity. Retry after the `Retry-After` seconds."},
+    },
 )
 
 if settings.cors_origins:

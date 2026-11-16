@@ -47,7 +47,7 @@ def call(method, path, token=None, body=None, form=None, timeout=90):
             status, raw = response.status, response.read()
     except urllib.error.HTTPError as exc:
         status, raw = exc.code, exc.read()
-    except Exception as exc:  # timeouts, resets
+    except OSError as exc:  # timeouts, refused or reset connections
         return 0, {"error": {"code": type(exc).__name__}}, time.perf_counter() - started
     try:
         payload = json.loads(raw or b"null")
@@ -62,9 +62,9 @@ def summary(label, results):
         f"{status} {payload['error']['code']}" if isinstance(payload, dict) and "error" in payload else str(status)
         for status, payload, _ in results
     )
-    pct = lambda q: latencies[min(len(latencies) - 1, int(q * len(latencies)))]  # noqa: E731
+    p95 = latencies[min(len(latencies) - 1, int(0.95 * len(latencies)))]
     print(f"{label}: {dict(outcomes)}")
-    print(f"   latency s: p50 {statistics.median(latencies):.2f}  p95 {pct(0.95):.2f}  max {latencies[-1]:.2f}")
+    print(f"   latency s: p50 {statistics.median(latencies):.2f}  p95 {p95:.2f}  max {latencies[-1]:.2f}")
 
 
 def simultaneously(tasks):

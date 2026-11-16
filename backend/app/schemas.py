@@ -17,6 +17,23 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# --- Errors ---------------------------------------------------------------
+
+
+class ErrorDetail(BaseModel):
+    code: str = Field(description="Stable identifier, for programs.", examples=["insufficient_capacity"])
+    message: str = Field(description="Explanation, for people.")
+    details: list[dict[str, str]] | None = Field(
+        default=None, description="Only for `validation_error`: one entry per rejected field."
+    )
+
+
+class ErrorResponse(BaseModel):
+    """The body of every error response."""
+
+    error: ErrorDetail
+
+
 # --- Auth -----------------------------------------------------------------
 
 

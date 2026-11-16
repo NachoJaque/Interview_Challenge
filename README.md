@@ -25,7 +25,7 @@ In the docs page, click **Authorize**, enter a demo account's email as `username
 
 1. Open the web app and log in with the demo customer. Availability on every page refreshes by itself every 3 seconds.
 2. Open **Summer Rock Festival**, pick tickets and press **Reserve tickets**. The tickets are now held and a countdown starts.
-3. Open a second browser tab and sign up as another customer. Sessions are per tab, so both stay logged in. The second customer sees the first one's tickets as reserved.
+3. Open a second browser tab and sign up as another customer. Sessions are per tab, so both stay logged in. The second customer sees fewer tickets available. (Only an admin sees how many are reserved and how many sold.)
 4. Back in the first tab, **Confirm purchase**, then go to **My purchases** and refund some of the tickets. The other tab shows them back on sale.
 5. Try the same on **Jazz Night** (50% refund), **Stand-up Comedy Special** (refunds closed) and **Indie Showcase** (two tabs competing for the last tickets).
 6. Log in as the admin and add a "Platinum" ticket type on any event page: it is on sale immediately, with no code change.
@@ -56,6 +56,8 @@ The same checks run on every push in [GitHub Actions](.github/workflows/ci.yml):
 | Refund logic | [backend/app/services/refunds.py](backend/app/services/refunds.py) |
 | Refund time windows | [backend/app/services/refund_policy.py](backend/app/services/refund_policy.py) |
 | Concurrency tests | [backend/tests/test_concurrency.py](backend/tests/test_concurrency.py) |
+| Staying up under a burst of buyers | [backend/app/admission.py](backend/app/admission.py), [scripts/load_test.py](scripts/load_test.py) |
+| Every error and its HTTP mapping | [backend/app/exceptions.py](backend/app/exceptions.py) |
 | Web app | [frontend/src](frontend/src) |
 
 ## Assumptions
