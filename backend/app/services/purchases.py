@@ -8,6 +8,7 @@ that no two transactions can deadlock:
 3. Hold locks for one purchase per transaction.
 """
 
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -24,6 +25,7 @@ from app.exceptions import (
     InvalidPurchaseStateError,
     NotFoundError,
     PendingReservationExistsError,
+    ReservationCancelledError,
     ReservationExpiredError,
     SalesClosedError,
     TicketLimitExceededError,
@@ -33,10 +35,11 @@ from app.models import Event, Purchase, PurchaseItem, PurchaseStatus, TicketType
 from app.schemas import PurchaseRequest
 
 ONE_PENDING_CONSTRAINT = "uq_purchases_one_pending_per_user_event"
+ABANDONED_STATUSES = (PurchaseStatus.CANCELLED, PurchaseStatus.EXPIRED)
+OWNED_STATUSES = (PurchaseStatus.COMPLETED, PurchaseStatus.PARTIALLY_REFUNDED)
 
 
-def _find_by_idempotency_key(db: Session, user_id: int, key: str) -> Purchase | None:
-    return db.scalar(select(Purchase).where(Purchase.user_id == user_id, Purchase.idempotency_key == key))
+# --- Shared building blocks -----------------------------------------------------
 
 
 def lock_purchase(db: Session, user: User, purchase_id: int) -> Purchase:
@@ -56,17 +59,48 @@ def lock_purchase(db: Session, user: User, purchase_id: int) -> Purchase:
     return purchase
 
 
-def _release_hold(db: Session, purchase: Purchase, new_status: PurchaseStatus) -> None:
-    """Return a pending purchase's held tickets to the pool. Caller holds the purchase lock."""
-    for item in sorted(purchase.items, key=lambda i: i.ticket_type_id):
+def move_tickets(db: Session, quantities: Iterable[tuple[int, int]], *, held: int = 0, sold: int = 0) -> None:
+    """Shift each ticket type's counters by its quantity, in the given directions.
+
+    `quantities` holds (ticket_type_id, quantity) pairs; `held` and `sold` are
+    -1, 0 or +1. Confirming, for instance, is `held=-1, sold=+1`.
+
+    This is the one place that walks ticket types in ascending id order
+    (locking rule 2). The caller must hold the purchase lock (rule 1).
+    """
+    for ticket_type_id, quantity in sorted(quantities):
         db.execute(
-            update(TicketType).where(TicketType.id == item.ticket_type_id).values(held=TicketType.held - item.quantity)
+            update(TicketType)
+            .where(TicketType.id == ticket_type_id)
+            .values(held=TicketType.held + held * quantity, sold=TicketType.sold + sold * quantity)
         )
+
+
+def _item_quantities(purchase: Purchase) -> list[tuple[int, int]]:
+    return [(item.ticket_type_id, item.quantity) for item in purchase.items]
+
+
+def _release_hold(db: Session, purchase: Purchase, new_status: PurchaseStatus) -> None:
+    """Return a pending purchase's held tickets to the pool."""
+    move_tickets(db, _item_quantities(purchase), held=-1)
     purchase.status = new_status
 
 
-def release_expired_purchases(db: Session, now: datetime | None = None, event_id: int | None = None) -> int:
+def _violated_constraint(exc: IntegrityError) -> str | None:
+    """Name of the database constraint behind an IntegrityError (psycopg reports it)."""
+    return getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+
+
+# --- Expiry ---------------------------------------------------------------------
+
+
+def release_expired_purchases(
+    db: Session, now: datetime | None = None, event_id: int | None = None, limit: int | None = None
+) -> int:
     """Expire pending reservations whose hold has run out. Returns how many were released.
+
+    `limit` caps the work of one call (oldest first). The background sweeper
+    runs without one; a purchase request passes a small one.
 
     Safe to run from several workers at once: each purchase is released in its
     own transaction, and SKIP LOCKED skips rows another transaction is busy
@@ -78,6 +112,8 @@ def release_expired_purchases(db: Session, now: datetime | None = None, event_id
     candidates = select(Purchase.id).where(expired)
     if event_id is not None:
         candidates = candidates.where(Purchase.event_id == event_id)
+    if limit is not None:
+        candidates = candidates.order_by(Purchase.expires_at).limit(limit)
     purchase_ids = db.scalars(candidates).all()
     db.rollback()  # end the read transaction; each release below is its own
 
@@ -99,44 +135,7 @@ def release_expired_purchases(db: Session, now: datetime | None = None, event_id
     return released
 
 
-def _check_customer_limits(
-    db: Session, user: User, event_id: int, requested: int, settings: Settings, now: datetime
-) -> None:
-    """Per-customer rules for one event. The caller has already established
-    that the user has no pending reservation for it; the partial unique index
-    then keeps concurrent requests from the same user from both passing."""
-    window_start = now - timedelta(minutes=settings.abandoned_reservation_window_minutes)
-    abandoned = db.scalar(  # count() and coalesce() never return NULL
-        select(func.count())
-        .select_from(Purchase)
-        .where(
-            Purchase.user_id == user.id,
-            Purchase.event_id == event_id,
-            Purchase.status.in_((PurchaseStatus.CANCELLED, PurchaseStatus.EXPIRED)),
-            Purchase.created_at >= window_start,
-        )
-    )
-    if (abandoned or 0) >= settings.max_abandoned_reservations:
-        raise TooManyReservationsError(
-            "You have cancelled or let expire too many reservations for this event. Please try again later."
-        )
-
-    owned = db.scalar(
-        select(func.coalesce(func.sum(PurchaseItem.quantity - PurchaseItem.refunded_quantity), 0))
-        .join(Purchase, PurchaseItem.purchase_id == Purchase.id)
-        .where(
-            Purchase.user_id == user.id,
-            Purchase.event_id == event_id,
-            Purchase.status.in_((PurchaseStatus.COMPLETED, PurchaseStatus.PARTIALLY_REFUNDED)),
-        )
-    )
-    owned = owned or 0
-    if owned + requested > settings.max_tickets_per_user_per_event:
-        left = max(settings.max_tickets_per_user_per_event - owned, 0)
-        raise TicketLimitExceededError(
-            f"A customer may hold at most {settings.max_tickets_per_user_per_event} tickets per event; "
-            f"you can buy {left} more."
-        )
+# --- Reserving ------------------------------------------------------------------
 
 
 def reserve_tickets(
@@ -150,64 +149,34 @@ def reserve_tickets(
 ) -> tuple[Purchase, bool]:
     """Hold tickets for a few minutes while the user completes the purchase.
 
-    Returns (purchase, created). Capacity is taken with one conditional UPDATE
-    per ticket type:
-
-        UPDATE ticket_types SET held = held + :qty
-        WHERE id = :id AND held + sold + :qty <= capacity
-
-    PostgreSQL row locks make concurrent UPDATEs on the same row wait and
-    re-check the WHERE clause, so two buyers can never both take the last
-    ticket. All holds and the purchase rows commit in a single transaction.
+    Returns (purchase, created); `created` is False when an idempotent retry
+    got back the reservation it had already made.
     """
     now = now or datetime.now(UTC)
 
-    if idempotency_key:
-        existing = _find_by_idempotency_key(db, user.id, idempotency_key)
-        if existing is not None:
-            if existing.event_id != event_id:
-                raise ConflictError("This Idempotency-Key was already used for a different purchase.")
-            return existing, False
+    replayed = _find_replay(db, user, event_id, idempotency_key)
+    if replayed is not None:
+        return replayed, False
 
-    # Give back stale holds first so availability does not depend on the
-    # background sweeper having run.
-    release_expired_purchases(db, now, event_id=event_id)
+    # Give back a few stale holds first, so availability does not depend on
+    # the background sweeper having run. Only a few: after a big sale thousands
+    # expire together, and no buyer should have to release them all.
+    release_expired_purchases(db, now, event_id=event_id, limit=settings.reservation_lazy_release_limit)
 
-    event = db.get(Event, event_id)
-    if event is None:
-        raise NotFoundError(f"Event {event_id} not found.")
-    if event.starts_at <= now:
-        raise SalesClosedError("Ticket sales are closed: the event has already started.")
+    event = _get_event_on_sale(db, event_id, now)
+    total_quantity = _validate_request(request, event, settings)
 
-    requested_ids = [item.ticket_type_id for item in request.items]
-    if len(set(requested_ids)) != len(requested_ids):
-        raise InvalidPurchaseError("Each ticket type may appear only once per purchase.")
-    total_quantity = sum(item.quantity for item in request.items)
-    if total_quantity > settings.max_tickets_per_purchase:
-        raise InvalidPurchaseError(f"A purchase may contain at most {settings.max_tickets_per_purchase} tickets.")
-
-    names = {tt.id: tt.name for tt in event.ticket_types}
-    for ticket_type_id in requested_ids:
-        if ticket_type_id not in names:
-            raise NotFoundError(f"Ticket type {ticket_type_id} does not belong to event {event_id}.")
-
-    pending = db.scalar(
-        select(Purchase).where(
-            Purchase.user_id == user.id,
-            Purchase.event_id == event_id,
-            Purchase.status == PurchaseStatus.PENDING,
-        )
-    )
+    pending = _find_pending(db, user, event_id)
     if pending is not None:
         if idempotency_key and pending.idempotency_key == idempotency_key:
-            # A concurrent retry of this same request committed first.
-            return pending, False
+            return pending, False  # a concurrent retry of this same request committed first
         raise PendingReservationExistsError(
             f"You already have a pending reservation for this event (purchase {pending.id}). "
             "Confirm or cancel it first."
         )
 
-    _check_customer_limits(db, user, event_id, total_quantity, settings, now)
+    _check_abandoned_reservations(db, user, event_id, settings, now)
+    _check_ticket_limit(db, user, event_id, total_quantity, settings)
 
     purchase = Purchase(
         user_id=user.id,
@@ -215,46 +184,15 @@ def reserve_tickets(
         status=PurchaseStatus.PENDING,
         idempotency_key=idempotency_key,
         expires_at=now + timedelta(minutes=settings.reservation_ttl_minutes),
+        items=_hold_tickets(db, event, request),
     )
-    total = Decimal("0.00")
-    for item in sorted(request.items, key=lambda i: i.ticket_type_id):
-        unit_price = db.scalar(
-            update(TicketType)
-            .where(
-                TicketType.id == item.ticket_type_id,
-                TicketType.held + TicketType.sold + item.quantity <= TicketType.capacity,
-            )
-            .values(held=TicketType.held + item.quantity)
-            .returning(TicketType.price)
-        )
-        if unit_price is None:
-            db.rollback()
-            raise InsufficientCapacityError(
-                f"Not enough '{names[item.ticket_type_id]}' tickets available for {item.quantity} ticket(s)."
-            )
-        purchase.items.append(
-            PurchaseItem(ticket_type_id=item.ticket_type_id, quantity=item.quantity, unit_price=unit_price)
-        )
-        total += unit_price * item.quantity
-
-    purchase.total_amount = total
+    purchase.total_amount = sum((item.unit_price * item.quantity for item in purchase.items), Decimal("0.00"))
     db.add(purchase)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        # Lost a race against another request from the same user. Rolling back
-        # also returns the tickets this request had just held.
-        db.rollback()
-        if idempotency_key:
-            existing = _find_by_idempotency_key(db, user.id, idempotency_key)
-            if existing is not None:
-                return existing, False
-        constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
-        if constraint == ONE_PENDING_CONSTRAINT:
-            raise PendingReservationExistsError(
-                "You already have a pending reservation for this event. Confirm or cancel it first."
-            ) from None
-        raise
+
+    winner = _commit_reservation(db, user, idempotency_key)
+    if winner is not None:
+        return winner, False
+
     audit(
         "reservation_created",
         purchase_id=purchase.id,
@@ -264,6 +202,166 @@ def reserve_tickets(
         total=purchase.total_amount,
     )
     return purchase, True
+
+
+def _find_by_idempotency_key(db: Session, user_id: int, key: str) -> Purchase | None:
+    return db.scalar(select(Purchase).where(Purchase.user_id == user_id, Purchase.idempotency_key == key))
+
+
+def _find_replay(db: Session, user: User, event_id: int, idempotency_key: str | None) -> Purchase | None:
+    """The purchase an earlier request with this key created, if any."""
+    if not idempotency_key:
+        return None
+    existing = _find_by_idempotency_key(db, user.id, idempotency_key)
+    if existing is not None and existing.event_id != event_id:
+        raise ConflictError("This Idempotency-Key was already used for a different purchase.")
+    return existing
+
+
+def _get_event_on_sale(db: Session, event_id: int, now: datetime) -> Event:
+    event = db.get(Event, event_id)
+    if event is None:
+        raise NotFoundError(f"Event {event_id} not found.")
+    _ensure_sales_open(event, now)
+    return event
+
+
+def _ensure_sales_open(event: Event, now: datetime) -> None:
+    if event.starts_at <= now:
+        raise SalesClosedError("Ticket sales are closed: the event has already started.")
+
+
+def _validate_request(request: PurchaseRequest, event: Event, settings: Settings) -> int:
+    """Check the request against the event. Returns the total number of tickets."""
+    requested_ids = [item.ticket_type_id for item in request.items]
+    if len(set(requested_ids)) != len(requested_ids):
+        raise InvalidPurchaseError("Each ticket type may appear only once per purchase.")
+
+    total_quantity = sum(item.quantity for item in request.items)
+    if total_quantity > settings.max_tickets_per_purchase:
+        raise InvalidPurchaseError(f"A purchase may contain at most {settings.max_tickets_per_purchase} tickets.")
+
+    event_ticket_type_ids = {ticket_type.id for ticket_type in event.ticket_types}
+    for ticket_type_id in requested_ids:
+        if ticket_type_id not in event_ticket_type_ids:
+            raise NotFoundError(f"Ticket type {ticket_type_id} does not belong to event {event.id}.")
+    return total_quantity
+
+
+def _find_pending(db: Session, user: User, event_id: int) -> Purchase | None:
+    return db.scalar(
+        select(Purchase).where(
+            Purchase.user_id == user.id,
+            Purchase.event_id == event_id,
+            Purchase.status == PurchaseStatus.PENDING,
+        )
+    )
+
+
+def _check_abandoned_reservations(db: Session, user: User, event_id: int, settings: Settings, now: datetime) -> None:
+    """Refuse customers who keep reserving this event's tickets without buying them."""
+    window_start = now - timedelta(minutes=settings.abandoned_reservation_window_minutes)
+    abandoned = db.scalar(
+        select(func.count())
+        .select_from(Purchase)
+        .where(
+            Purchase.user_id == user.id,
+            Purchase.event_id == event_id,
+            Purchase.status.in_(ABANDONED_STATUSES),
+            Purchase.created_at >= window_start,
+        )
+    )
+    assert abandoned is not None  # COUNT never returns NULL
+    if abandoned >= settings.max_abandoned_reservations:
+        raise TooManyReservationsError(
+            "You have cancelled or let expire too many reservations for this event. Please try again later."
+        )
+
+
+def _check_ticket_limit(db: Session, user: User, event_id: int, requested: int, settings: Settings) -> None:
+    """Cap the tickets one customer holds for an event across all their purchases.
+
+    The caller has established that the user has no pending reservation for
+    the event, and the partial unique index keeps two concurrent requests
+    from the same user from both getting past that check.
+    """
+    owned = db.scalar(
+        select(func.coalesce(func.sum(PurchaseItem.quantity - PurchaseItem.refunded_quantity), 0))
+        .join(Purchase, PurchaseItem.purchase_id == Purchase.id)
+        .where(
+            Purchase.user_id == user.id,
+            Purchase.event_id == event_id,
+            Purchase.status.in_(OWNED_STATUSES),
+        )
+    )
+    assert owned is not None  # COALESCE never returns NULL
+    limit = settings.max_tickets_per_user_per_event
+    if owned + requested > limit:
+        raise TicketLimitExceededError(
+            f"A customer may hold at most {limit} tickets per event; you can buy {max(limit - owned, 0)} more."
+        )
+
+
+def _hold_tickets(db: Session, event: Event, request: PurchaseRequest) -> list[PurchaseItem]:
+    """Take capacity for every requested ticket type, or for none of them.
+
+    One conditional UPDATE per ticket type checks and takes capacity at once:
+
+        UPDATE ticket_types SET held = held + :qty
+        WHERE id = :id AND held + sold + :qty <= capacity
+        RETURNING price
+
+    PostgreSQL row locks make concurrent UPDATEs on the same row wait and
+    re-check the WHERE clause, so two buyers can never both take the last
+    ticket. The holds commit together with the purchase.
+    """
+    names = {ticket_type.id: ticket_type.name for ticket_type in event.ticket_types}
+    items = []
+    for requested in sorted(request.items, key=lambda item: item.ticket_type_id):  # locking rule 2
+        unit_price = db.scalar(
+            update(TicketType)
+            .where(
+                TicketType.id == requested.ticket_type_id,
+                TicketType.held + TicketType.sold + requested.quantity <= TicketType.capacity,
+            )
+            .values(held=TicketType.held + requested.quantity)
+            .returning(TicketType.price)
+        )
+        if unit_price is None:
+            db.rollback()  # gives back what this request had already held
+            raise InsufficientCapacityError(
+                f"Not enough '{names[requested.ticket_type_id]}' tickets available for {requested.quantity} ticket(s)."
+            )
+        items.append(
+            PurchaseItem(ticket_type_id=requested.ticket_type_id, quantity=requested.quantity, unit_price=unit_price)
+        )
+    return items
+
+
+def _commit_reservation(db: Session, user: User, idempotency_key: str | None) -> Purchase | None:
+    """Commit the new reservation.
+
+    Returns None on success. If another request from the same user committed
+    first, the unique indexes reject this one: rolling back also returns the
+    tickets it had held, and the result is that earlier purchase (same
+    idempotency key) or an error (a different reservation for the event).
+    """
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        winner = _find_by_idempotency_key(db, user.id, idempotency_key) if idempotency_key else None
+        if winner is not None:
+            return winner
+        if _violated_constraint(exc) == ONE_PENDING_CONSTRAINT:
+            raise PendingReservationExistsError(
+                "You already have a pending reservation for this event. Confirm or cancel it first."
+            ) from None
+        raise
+    return None
+
+
+# --- Confirming and cancelling ----------------------------------------------------
 
 
 def confirm_purchase(db: Session, user: User, purchase_id: int, now: datetime | None = None) -> Purchase:
@@ -277,8 +375,10 @@ def confirm_purchase(db: Session, user: User, purchase_id: int, now: datetime | 
 
     if purchase.status == PurchaseStatus.COMPLETED:
         return purchase
-    if purchase.status in (PurchaseStatus.EXPIRED, PurchaseStatus.CANCELLED):
-        raise ReservationExpiredError(f"This reservation is {purchase.status.value} and can no longer be confirmed.")
+    if purchase.status == PurchaseStatus.CANCELLED:
+        raise ReservationCancelledError("This reservation was cancelled and can no longer be confirmed.")
+    if purchase.status == PurchaseStatus.EXPIRED:
+        raise ReservationExpiredError("This reservation has expired and can no longer be confirmed.")
     if purchase.status != PurchaseStatus.PENDING:
         raise InvalidPurchaseStateError("This purchase has already been confirmed.")
     if purchase.expires_at <= now:
@@ -286,15 +386,9 @@ def confirm_purchase(db: Session, user: User, purchase_id: int, now: datetime | 
         db.commit()
         audit("reservation_expired", purchase_id=purchase.id, user_id=user.id)
         raise ReservationExpiredError("This reservation has expired and its tickets were released.")
-    if purchase.event.starts_at <= now:
-        raise SalesClosedError("Ticket sales are closed: the event has already started.")
+    _ensure_sales_open(purchase.event, now)
 
-    for item in sorted(purchase.items, key=lambda i: i.ticket_type_id):
-        db.execute(
-            update(TicketType)
-            .where(TicketType.id == item.ticket_type_id)
-            .values(held=TicketType.held - item.quantity, sold=TicketType.sold + item.quantity)
-        )
+    move_tickets(db, _item_quantities(purchase), held=-1, sold=+1)
     purchase.status = PurchaseStatus.COMPLETED
     purchase.confirmed_at = now
     db.commit()

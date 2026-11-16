@@ -1,15 +1,15 @@
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.audit import audit
 from app.config import Settings
 from app.exceptions import InvalidPurchaseError, NotFoundError, RefundNotAllowedError
-from app.models import Purchase, PurchaseStatus, Refund, RefundItem, TicketType, User
+from app.models import Purchase, PurchaseStatus, Refund, RefundItem, User
 from app.schemas import RefundRequest
-from app.services.purchases import lock_purchase
+from app.services.purchases import lock_purchase, move_tickets
 from app.services.refund_policy import RefundDecision, evaluate_refund_window
 
 CENT = Decimal("0.01")
@@ -86,19 +86,20 @@ def create_refund(
         idempotency_key=idempotency_key,
         amount=Decimal("0.00"),
     )
-    for req in sorted(request.items, key=lambda r: items_by_id[r.purchase_item_id].ticket_type_id):
+    for req in request.items:
         item = items_by_id[req.purchase_item_id]
         # Rounded per ticket, so refunding tickets one by one or together
         # always pays exactly the same.
         per_ticket = (item.unit_price * decision.percentage / 100).quantize(CENT, ROUND_HALF_UP)
         amount = per_ticket * req.quantity
         item.refunded_quantity += req.quantity
-        db.execute(
-            update(TicketType).where(TicketType.id == item.ticket_type_id).values(sold=TicketType.sold - req.quantity)
-        )
         refund.items.append(RefundItem(purchase_item=item, quantity=req.quantity, amount=amount))
         refund.amount += amount
 
+    # Refunded tickets go straight back on sale.
+    move_tickets(
+        db, [(items_by_id[req.purchase_item_id].ticket_type_id, req.quantity) for req in request.items], sold=-1
+    )
     purchase.refunds.append(refund)
     fully_refunded = all(item.refundable_quantity == 0 for item in purchase.items)
     purchase.status = PurchaseStatus.REFUNDED if fully_refunded else PurchaseStatus.PARTIALLY_REFUNDED

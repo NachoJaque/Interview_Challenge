@@ -96,6 +96,14 @@ class EventRead(ORMModel):
 # --- Purchases -------------------------------------------------------------
 
 
+class PurchaseRulesRead(BaseModel):
+    """The limits the API enforces, so clients can show them without copying them."""
+
+    max_tickets_per_purchase: int
+    max_tickets_per_user_per_event: int
+    reservation_ttl_minutes: int
+
+
 class PurchaseItemRequest(RequestModel):
     ticket_type_id: int = Field(gt=0, le=2_147_483_647)
     quantity: int = Field(gt=0, le=100)

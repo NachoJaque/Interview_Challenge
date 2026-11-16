@@ -5,17 +5,30 @@
 # (or set COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml in .env)
 #
 # Differences from local: Caddy terminates HTTPS and is the only container
-# reachable from outside; real secrets are mandatory; everything restarts on boot.
+# reachable from outside; real secrets are mandatory; everything restarts on
+# boot; container logs are rotated.
+
+# Without a limit, container logs grow until the disk is full. The audit trail
+# writes a line per operation, so this matters. Keeps the last 50 MB per service.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
 
 services:
   db:
     restart: unless-stopped
+    logging: *default-logging
     ports: !reset []
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
 
   api:
     restart: unless-stopped
+    logging: *default-logging
+    # Time for requests in flight to finish when the container is replaced.
+    stop_grace_period: 30s
     ports: !reset []
     environment:
       ENVIRONMENT: production
@@ -25,6 +38,7 @@ services:
 
   frontend:
     restart: unless-stopped
+    logging: *default-logging
     ports: !reset []
     volumes:
       # Behind Caddy, read the client's address from X-Forwarded-For.
@@ -33,6 +47,7 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *default-logging
     depends_on:
       - frontend
     environment:

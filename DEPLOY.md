@@ -115,11 +115,25 @@ docker compose logs -f caddy
 
 ## Operations
 
-Update to the latest code:
+Update to the latest code. Building first keeps the interruption to the few seconds it takes to swap the containers; requests in flight are given time to finish, and nginx finds the new API container on its own:
 
 ```bash
-git pull && docker compose up -d --build
+git pull && docker compose build && docker compose up -d
 ```
+
+Back up the database (a compressed dump in `backups/`; dumps older than 14 days are removed):
+
+```bash
+sh scripts/backup.sh
+```
+
+To run it every night at 03:00, add this line with `crontab -e`:
+
+```
+0 3 * * * cd /home/ubuntu/tickets && sh scripts/backup.sh >> backups/backup.log 2>&1
+```
+
+The dumps live on the same disk as the database, so they protect against a mistake, not against losing the machine. Copy them elsewhere (for example to Object Storage) if the data matters. Restoring is described at the top of [scripts/backup.sh](scripts/backup.sh).
 
 Reset the demo data (deletes every account and purchase, then seeds again; needs `SEED_DEMO_DATA=true` in `.env`):
 
@@ -140,6 +154,21 @@ The audit trail (one JSON line per reservation, confirmation, refund, login…):
 ```bash
 docker compose logs api | grep " audit "
 ```
+
+## Capacity
+
+One API process serves 40 requests at a time (`DB_POOL_SIZE`) and queues the rest; see "Behaviour under load" in the README. Container logs are rotated at 50 MB per service.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `DB_POOL_SIZE` | `40` | Database connections, and requests in progress at once |
+| `REQUEST_QUEUE_TIMEOUT_SECONDS` | `10` | How long a request may queue before a `503` |
+| `MAX_CONCURRENT_REQUESTS` | `500` | Requests in progress plus queued; beyond it, an immediate `503` |
+| `EVENTS_CACHE_SECONDS` | `1` | How stale the event data may be |
+
+PostgreSQL allows 100 connections by default, so more than two API processes need a connection pooler such as PgBouncer.
+
+To see how the machine copes before a real sale, run [scripts/load_test.py](scripts/load_test.py) against a disposable copy of the stack.
 
 ## Troubleshooting
 

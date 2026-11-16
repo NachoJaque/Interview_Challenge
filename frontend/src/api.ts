@@ -73,6 +73,13 @@ export interface Purchase {
   refund_policy: { allowed: boolean; percentage: number; reason: string };
 }
 
+/** The limits the API enforces, read from it so they are never copied here. */
+export interface PurchaseRules {
+  max_tickets_per_purchase: number;
+  max_tickets_per_user_per_event: number;
+  reservation_ttl_minutes: number;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -93,20 +100,16 @@ export const getToken = () => sessionStorage.getItem(TOKEN_KEY);
 export const setToken = (token: string) => sessionStorage.setItem(TOKEN_KEY, token);
 export const clearToken = () => sessionStorage.removeItem(TOKEN_KEY);
 
+/** Every API error has the same body: `{ error: { code, message } }`. */
 export function errorMessage(status: number, body: unknown): { message: string; code?: string } {
   if (body && typeof body === "object") {
-    const { error, detail } = body as {
-      error?: { code: string; message: string };
-      detail?: string | { msg: string; loc?: (string | number)[] }[];
-    };
+    const { error } = body as { error?: { code: string; message: string } };
     if (error) return { message: error.message, code: error.code };
-    if (typeof detail === "string") return { message: detail };
-    if (Array.isArray(detail) && detail.length > 0) {
-      const field = detail[0].loc?.slice(1).join(".");
-      return { message: field ? `${field}: ${detail[0].msg}` : detail[0].msg };
-    }
   }
-  // 429 without a body comes from the web server's rate limit.
+  // Without a JSON body, these come from the servers in front of the API.
+  if (status === 502 || status === 503 || status === 504) {
+    return { message: "The site is very busy right now. Please try again in a few seconds.", code: "service_busy" };
+  }
   if (status === 429) return { message: "Too many attempts. Please wait a minute and try again." };
   return { message: "Something went wrong. Please try again." };
 }
@@ -153,6 +156,8 @@ export const api = {
     }),
 
   me: () => request<User>("/auth/me"),
+
+  purchaseRules: () => request<PurchaseRules>("/purchase-rules"),
 
   events: () => request<EventSummary[]>("/events"),
   event: (id: number) => request<EventSummary>(`/events/${id}`),

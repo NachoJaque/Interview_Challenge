@@ -184,6 +184,7 @@ Se prefiere a `SELECT ... FOR UPDATE` porque es una sola ida a la base de datos 
 | **POST** | **`/purchases/{id}/refunds`** | usuario | **Reembolso** total o parcial (cabecera `Idempotency-Key` opcional) |
 | GET | `/purchases` | usuario | Mis compras, paginado |
 | GET | `/purchases/{id}` | usuario | Detalle, con la política de reembolso vigente |
+| GET | `/purchase-rules` | público | Límites de compra vigentes |
 
 Códigos: `201` creado, `401` sin sesión, `403` sin permiso, `404` no existe, `409` sin cupo, reserva vencida o conflicto, `422` regla de negocio o datos inválidos, `429` demasiadas reservas abandonadas o demasiadas peticiones. Los errores de negocio comparten formato: `{"error": {"code", "message"}}`.
 
@@ -219,6 +220,8 @@ backend/
   app/
     main.py            # app, id de petición, cabeceras, manejadores de error, tarea de vencimiento
     audit.py           # registro de auditoría
+    admission.py       # cuántas peticiones pueden estar en curso a la vez
+    cache.py           # caché de un segundo para los datos de eventos
     config.py          # ajustes por variables de entorno
     database.py        # engine y sesión
     models.py          # modelos SQLAlchemy
@@ -350,6 +353,50 @@ Con el sitio ya publicado se revisó el programa completo. No apareció inyecci�
 - **Datos de demostración opcionales** (`SEED_DEMO_DATA`): activos en local, apagados por defecto en producción. La cuenta de administrador se crea siempre.
 - **CORS cerrado por defecto:** el frontend y la API comparten origen.
 - **Integración continua** en GitHub Actions: linter y formato (`ruff`), tipos (`mypy`), migraciones contra modelos, tests de backend y frontend, y construcción de las imágenes.
+
+### Limpieza del código (SOLID, DRY, Clean Code)
+
+Una segunda revisión, centrada en la estructura, no encontró errores pero sí siete puntos que se corrigieron sin cambiar el comportamiento:
+
+- **`reserve_tickets` hacía siete cosas en 125 líneas.** Ahora orquesta pasos con nombre: buscar el reintento, validar la petición, comprobar la reserva pendiente, aplicar los dos límites por cliente, apartar las entradas y guardar. Cada paso se lee y se prueba por separado.
+- **El movimiento de contadores estaba escrito cuatro veces.** Se concentró en `move_tickets`, que además es el único lugar que respeta el orden ascendente de id que evita interbloqueos. Antes esa regla dependía de recordarla en cada sitio.
+- **La API tenía dos formatos de error.** Autenticación usaba el de FastAPI y el resto el propio. Ahora todo error, incluidos los de validación y los del framework, responde `{"error": {code, message}}`. El cliente solo entiende una forma, y los errores de validación ya no devuelven el valor rechazado.
+- **Un middleware hacía dos trabajos** (id de petición y cabeceras de seguridad). Se separó en dos.
+- **El frontend copiaba los límites del backend.** Ahora los lee de `GET /purchase-rules`; cambiar la configuración ya no deja la web desactualizada.
+- **Los tests de la revisión anterior estaban agrupados por cuándo se escribieron.** Se repartieron por funcionalidad y los helpers duplicados quedaron en un solo lugar.
+- **Confirmar una reserva cancelada respondía "expirada".** Tiene ahora su propio error, `reservation_cancelled`.
+
+Lo que se dejó para no sobre-diseñar: los tramos de reembolso siguen siendo dos condiciones en una función pura (convertirlos en una lista configurable solo se justifica si aparece un tercero) y el engine de base de datos se sigue creando al importar el módulo.
+
+### Carga y producción
+
+La última revisión buscó qué fallaría con el sistema desplegado y, en particular, qué pasa cuando muchísima gente compra a la vez. Se midió con una prueba de carga (`scripts/load_test.py`): N compradores compiten en el mismo instante por 50 entradas.
+
+| Paso | Antes | Después |
+|------|-------|---------|
+| 200 logins a la vez | 15 correctos, 80 errores 500, 105 sin respuesta tras 90 s | 200 correctos en 3 s |
+| 200 reservas a la vez | 6 correctas, 68 errores 500, 126 sin respuesta | 50 correctas, 150 con "no hay suficientes", todo en 2,4 s |
+| Reservas hechas sin que el comprador se enterara | 33 | 0 |
+| Otros visitantes mientras tanto | Errores y esperas de 30 a 90 s | Sin efecto |
+| 600 compradores a la vez | no se probó | Exactamente 50 ganadores; el exceso sobre la capacidad recibió un 503 inmediato |
+
+**La causa.** Una petición conserva su conexión a la base mientras salta entre hilos de trabajo (autenticación, ejecución, armado de la respuesta). En una ráfaga, unas peticiones tenían conexión y esperaban un hilo, y el resto tenía hilo y esperaba una conexión: nada avanzaba hasta que el grupo de conexiones agotaba su espera. Nunca se sobrevendió, pero el sitio dejaba de responder y algunas reservas quedaban hechas sin que el cliente lo supiera.
+
+**Por qué no bastó con más conexiones.** Se probó ampliar el grupo de 15 a 60: el tráfico moderado mejoró, pero la ráfaga siguió fallando, porque el número de peticiones que retienen una conexión no estaba acotado por nada.
+
+**La decisión: control de admisión.** Solo entran a la aplicación tantas peticiones a la vez como conexiones hay (40). La que está dentro tiene garantizados una conexión y un hilo; las demás esperan en orden de llegada sin consumir ninguno. Si la espera pasa de 10 segundos, o la cola supera un tope, la respuesta es `503` con indicación de reintentar. Se prefirió a otras opciones porque establece una garantía simple de explicar y de probar, en un solo lugar del código.
+
+Otras medidas de la misma revisión:
+
+- **Tiempos límite en la base de datos** (sentencia, bloqueo, transacción inactiva): una consulta colgada ya no detiene a todos los compradores de un tipo de entrada.
+- **Liberación acotada de reservas vencidas:** cada compra libera como mucho 5; el resto lo hace la tarea de fondo. Tras una venta grande vencen miles a la vez.
+- **Caché de un segundo para los datos de eventos,** que todas las páginas consultan cada 3 segundos. La compra siempre comprueba el número real.
+- **El frontend deja de consultar con la pestaña oculta** y espacia las consultas tras un error.
+- **El login ya no retiene una conexión mientras calcula el hash.**
+- **Límite de escrituras por cuenta y no por IP,** para no frenar a quienes comparten dirección.
+- **Operación:** rotación de registros, script de copia de seguridad, despliegue con construcción previa, y nginx que sigue a la API cuando su contenedor se reemplaza.
+
+Lo que queda fuera: es un solo proceso en una sola máquina. Para una venta con decenas de miles de compradores, los pasos siguientes son varios procesos de API con un agrupador de conexiones y una sala de espera que deje pasar a los compradores al ritmo que el sistema puede atender.
 
 ### Lo que se dejó como está, y por qué
 

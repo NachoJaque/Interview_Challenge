@@ -42,9 +42,9 @@ python -m venv .venv
 .venv/bin/pytest                                 # Windows: .venv\Scripts\pytest
 ```
 
-102 tests, including concurrency tests that fire simultaneous requests from real threads. They use a separate `krunchbox_test` database, created automatically.
+119 tests, including concurrency tests that fire simultaneous requests from real threads. They use a separate `krunchbox_test` database, created automatically.
 
-The same checks run on every push in [GitHub Actions](.github/workflows/ci.yml): `ruff` (lint and format), `mypy`, a check that the migrations match the models, the backend tests, the frontend unit tests (`npm test`) and the Docker build.
+The same checks run on every push in [GitHub Actions](.github/workflows/ci.yml): `ruff` (lint and format), `mypy`, a check that the migrations match the models, the backend tests, the frontend unit tests (`npm test`, 15 tests) and the Docker build.
 
 ## Where to look first
 
@@ -129,6 +129,34 @@ Around that core:
 - **Database constraints as the last line of defence.** Even if application code were wrong, `CHECK (held >= 0 AND sold >= 0 AND held + sold <= capacity)` rejects an oversell.
 - **Idempotency.** Reserving and refunding both accept an `Idempotency-Key` header; a retry after a lost response returns the original result instead of holding or refunding tickets a second time.
 
+## Behaviour under load
+
+The hard part of a ticket sale is the moment it opens: far more buyers than tickets, all at once. Two things have to hold. Nobody gets a ticket that does not exist, and the site keeps answering.
+
+The first is the conditional `UPDATE` above. The second is admission control ([backend/app/admission.py](backend/app/admission.py)): only as many requests are inside the application at once as there are database connections. A request in progress is therefore guaranteed a connection and a worker thread; the rest wait in order of arrival, using neither. One that waits more than a few seconds is answered `503` with `Retry-After`, and beyond a ceiling of queued requests the server answers `503` immediately. Slow is acceptable, a hung page is not.
+
+This came out of a load test, not out of design. [scripts/load_test.py](scripts/load_test.py) makes N buyers compete at the same instant for 50 tickets. Measured on a development laptop, single API process:
+
+| Step | Before | After |
+|------|--------|-------|
+| 200 logins at once | 15 succeeded, 80 answered 500, 105 timed out after 90 s | 200 succeeded in 3 s |
+| 200 reservations at once | 6 succeeded, 68 answered 500, 126 timed out | 50 succeeded, 150 told "not enough tickets", all within 2.4 s |
+| Reservations the buyer never heard about | 33 | 0 |
+| Other visitors meanwhile | Errors and waits of 30 to 90 s | Unaffected |
+| 600 buyers at once | not attempted | Exactly 50 winners; the excess over capacity got an immediate 503 |
+
+The cause of the "before" column: a request keeps its database connection while it moves between worker threads. In a burst, some requests held a connection and waited for a thread while the rest held a thread and waited for a connection, and nothing moved until the pool timed out. Capacity was never oversold, even then.
+
+Around it:
+
+- **Timeouts in the database** (statement, lock, idle transaction), so one stuck query cannot stall every buyer of a ticket type.
+- **A purchase request releases at most a few expired reservations** on its way in; the background sweeper does the rest. After a big sale thousands expire together, and no buyer should pay for that.
+- **Event data is cached for one second.** Every open page polls it, so this turns thousands of identical queries into one per second. Availability can be a second old; the purchase itself always checks the real number.
+- **The web app is careful with the server:** it stops polling while its tab is hidden and slows down after errors.
+- **Passwords are hashed without holding a database connection.**
+
+What it does not do: it is still one process on one machine. The next steps for a sale with tens of thousands of buyers are several API processes behind a connection pooler, and a waiting room that lets buyers in at the rate the system can serve.
+
 ## Business rules
 
 ### Reserving and buying
@@ -184,14 +212,15 @@ Limits, time windows and the percentage are settings ([backend/app/config.py](ba
 | **POST** | **`/purchases/{id}/refunds`** | user | **Refund all or some tickets** |
 | GET | `/purchases` | user | My purchases, newest first (`limit`, `offset`) |
 | GET | `/purchases/{id}` | user | One purchase, with the refund it would get right now |
+| GET | `/purchase-rules` | public | The purchase limits in force (the web app reads them from here) |
 
-Business errors share one shape, with a stable code for clients:
+Every error has the same shape, with a stable code for clients. That covers business rules, authentication, input validation (which adds a `details` list of field and message) and errors raised by the framework itself:
 
 ```json
 { "error": { "code": "insufficient_capacity", "message": "Not enough 'VIP' tickets available for 2 ticket(s)." } }
 ```
 
-`401` not logged in · `403` not allowed · `404` not found · `409` sold out, expired reservation or conflict · `422` business rule or invalid input · `429` too many abandoned reservations or too many requests.
+`401` not logged in · `403` not allowed · `404` not found · `409` sold out, expired reservation or conflict · `422` business rule or invalid input · `429` too many abandoned reservations or too many requests · `503` over capacity, retry shortly (`Retry-After`).
 
 Everyone sees how many tickets are available. The split of the rest into reserved (`held`) and `sold` is the venue's sales data: those two fields are `null` unless the caller is an admin.
 
@@ -202,12 +231,14 @@ Every response carries an `X-Request-ID`. The same id is written with each line 
 ```
 backend/app/
   main.py            app, request ids, security headers, error handlers, expiry task
+  admission.py       how many requests may be in progress at once
+  cache.py           one-second cache for the event data every page polls
   audit.py           audit log: one JSON line per business event
   models.py          SQLAlchemy models
   schemas.py         request and response schemas
   routers/           thin endpoints: validate, delegate, respond
   services/          business logic, independent of HTTP
-  exceptions.py      domain errors, mapped to HTTP in one place
+  exceptions.py      every error and its single mapping to an HTTP response
   security.py        password hashing and JWT
   deps.py            database session, current user, admin check
   seed.py            admin account and demo data
@@ -236,7 +267,8 @@ Endpoints contain no business logic. They call a service function, which raises 
 | CSRF | The token travels in the `Authorization` header, not a cookie, so another site cannot use it |
 | XSS | React escapes everything it renders; a strict `Content-Security-Policy` allows scripts and styles only from the app's own origin |
 | Brute force | nginx limits login and sign-up to 20 requests per minute per IP, answering `429` beyond that |
-| Abuse of writes | nginx limits every other write to 60 per minute per IP, and all API traffic to 20 requests per second per IP |
+| Abuse of writes | nginx limits every other write to 60 per minute per customer (keyed by session token, so people sharing an address do not throttle each other) and all API traffic to 100 requests per second per IP |
+| Overload | Admission control and a cap on queued requests answer `503` instead of letting the site hang; database timeouts stop one stuck query from blocking the rest |
 | Holding tickets without buying | One pending reservation per customer and event, a cap on abandoned reservations, and a cap on tickets per customer and event |
 | Duplicate refunds | Refunds are idempotent by key and serialized by a row lock on the purchase |
 | Sales data | Only admins see the reserved/sold breakdown of each ticket type |

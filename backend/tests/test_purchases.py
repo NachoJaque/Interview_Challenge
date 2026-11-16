@@ -10,23 +10,16 @@ from app.exceptions import (
     InvalidPurchaseStateError,
     NotFoundError,
     PendingReservationExistsError,
+    ReservationCancelledError,
     ReservationExpiredError,
     SalesClosedError,
+    TicketLimitExceededError,
+    TooManyReservationsError,
 )
 from app.models import PurchaseStatus
-from app.schemas import PurchaseRequest
-from app.services.purchases import (
-    cancel_purchase,
-    confirm_purchase,
-    release_expired_purchases,
-    reserve_tickets,
-)
-from tests.conftest import counters, ticket_type
-
-
-def request_for(*pairs: tuple[int, int]) -> PurchaseRequest:
-    return PurchaseRequest(items=[{"ticket_type_id": tt_id, "quantity": qty} for tt_id, qty in pairs])
-
+from app.services.purchases import cancel_purchase, confirm_purchase, release_expired_purchases, reserve_tickets
+from app.services.refunds import create_refund
+from tests.conftest import counters, refund_of, request_for, ticket_type
 
 # --- Reserving ---------------------------------------------------------------
 
@@ -250,7 +243,7 @@ def test_cannot_confirm_a_cancelled_reservation(db, user, make_event, settings):
     purchase, _ = reserve_tickets(db, user, event.id, request_for((ticket_type(event, "General").id, 1)), settings)
     cancel_purchase(db, user, purchase.id)
 
-    with pytest.raises(ReservationExpiredError):
+    with pytest.raises(ReservationCancelledError):
         confirm_purchase(db, user, purchase.id)
 
 
@@ -311,3 +304,125 @@ def test_user_can_reserve_again_after_their_reservation_expired(db, user, make_e
 
     assert created
     assert counters(general.id) == (4, 0)
+
+
+# --- Limits per customer ------------------------------------------------------
+
+
+def test_repeatedly_abandoning_reservations_is_blocked(db, user, make_event, settings):
+    event = make_event()
+    vip = ticket_type(event, "VIP")
+
+    for _ in range(settings.max_abandoned_reservations):
+        purchase, _ = reserve_tickets(db, user, event.id, request_for((vip.id, 2)), settings)
+        cancel_purchase(db, user, purchase.id)
+
+    with pytest.raises(TooManyReservationsError):
+        reserve_tickets(db, user, event.id, request_for((vip.id, 2)), settings)
+    assert counters(vip.id) == (0, 0)
+
+
+def test_expired_reservations_count_as_abandoned(db, user, make_event, settings):
+    event = make_event()
+    vip = ticket_type(event, "VIP")
+    now = datetime.now(UTC)
+
+    for i in range(settings.max_abandoned_reservations):
+        start = now + timedelta(minutes=11 * i)
+        reserve_tickets(db, user, event.id, request_for((vip.id, 1)), settings, now=start)
+        release_expired_purchases(db, now=start + timedelta(minutes=10, seconds=1))
+
+    with pytest.raises(TooManyReservationsError):
+        reserve_tickets(db, user, event.id, request_for((vip.id, 1)), settings, now=now + timedelta(minutes=40))
+
+
+def test_abandoned_reservations_are_forgotten_after_the_window(db, user, make_event, settings):
+    event = make_event()
+    vip = ticket_type(event, "VIP")
+    for _ in range(settings.max_abandoned_reservations):
+        purchase, _ = reserve_tickets(db, user, event.id, request_for((vip.id, 1)), settings)
+        cancel_purchase(db, user, purchase.id)
+
+    later = datetime.now(UTC) + timedelta(minutes=settings.abandoned_reservation_window_minutes + 1)
+    purchase, created = reserve_tickets(db, user, event.id, request_for((vip.id, 1)), settings, now=later)
+
+    assert created
+
+
+def test_the_block_applies_per_event_and_per_customer(db, make_user, make_event, settings):
+    hoarder, other = make_user(), make_user()
+    event, other_event = make_event(), make_event()
+    vip = ticket_type(event, "VIP")
+    for _ in range(settings.max_abandoned_reservations):
+        purchase, _ = reserve_tickets(db, hoarder, event.id, request_for((vip.id, 1)), settings)
+        cancel_purchase(db, hoarder, purchase.id)
+
+    assert reserve_tickets(db, other, event.id, request_for((vip.id, 1)), settings)[1]
+    other_vip = ticket_type(other_event, "VIP")
+    assert reserve_tickets(db, hoarder, other_event.id, request_for((other_vip.id, 1)), settings)[1]
+
+
+def test_completed_purchases_do_not_count_as_abandoned(db, user, make_event, settings, buy):
+    event = make_event()
+    for _ in range(settings.max_abandoned_reservations + 1):
+        buy(user, event, General=1)
+
+    assert counters(ticket_type(event, "General").id) == (0, settings.max_abandoned_reservations + 1)
+
+
+def test_a_customer_cannot_exceed_the_per_event_limit_across_purchases(db, user, make_event, settings, buy):
+    event = make_event()
+    general = ticket_type(event, "General")
+    buy(user, event, General=10)
+    buy(user, event, General=10)
+
+    with pytest.raises(TicketLimitExceededError):
+        reserve_tickets(db, user, event.id, request_for((general.id, 1)), settings)
+    assert counters(general.id) == (0, 20)
+
+
+def test_refunded_tickets_free_room_under_the_limit(db, user, make_event, settings, buy):
+    event = make_event()
+    general = ticket_type(event, "General")
+    buy(user, event, General=10)
+    purchase = buy(user, event, General=10)
+    create_refund(db, user, purchase.id, refund_of((purchase.items[0].id, 4)), settings)
+
+    with pytest.raises(TicketLimitExceededError):
+        reserve_tickets(db, user, event.id, request_for((general.id, 5)), settings)
+    assert buy(user, event, General=4).status == PurchaseStatus.COMPLETED
+
+
+def test_the_limit_is_per_customer(db, make_user, make_event, settings, buy):
+    event = make_event()
+    first, second = make_user(), make_user()
+    buy(first, event, General=10)
+    buy(first, event, General=10)
+
+    assert buy(second, event, General=10).status == PurchaseStatus.COMPLETED
+
+
+def test_a_reservation_cannot_be_confirmed_after_the_event_starts(db, user, make_event, settings):
+    event = make_event(starts_in=timedelta(minutes=5))
+    general = ticket_type(event, "General")
+    purchase, _ = reserve_tickets(db, user, event.id, request_for((general.id, 1)), settings)
+
+    with pytest.raises(SalesClosedError):
+        confirm_purchase(db, user, purchase.id, now=datetime.now(UTC) + timedelta(minutes=6))
+    assert counters(general.id) == (1, 0)  # still held; the sweeper releases it
+
+
+def test_a_purchase_request_releases_only_a_few_expired_reservations(db, make_user, make_event, settings):
+    event = make_event()
+    general = ticket_type(event, "General")
+    backlog = settings.reservation_lazy_release_limit + 3
+    for _ in range(backlog):
+        reserve_tickets(db, make_user(), event.id, request_for((general.id, 1)), settings)
+    after_expiry = datetime.now(UTC) + timedelta(minutes=settings.reservation_ttl_minutes + 1)
+
+    reserve_tickets(db, make_user(), event.id, request_for((general.id, 1)), settings, now=after_expiry)
+
+    # The newcomer holds 1; it released `limit` of the backlog and left 3 for the sweeper.
+    assert counters(general.id) == (3 + 1, 0)
+    assert release_expired_purchases(db, after_expiry) == 3
+    assert counters(general.id) == (1, 0)

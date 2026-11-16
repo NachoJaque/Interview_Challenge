@@ -1,34 +1,14 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from app.exceptions import InvalidPurchaseError, NotFoundError, RefundNotAllowedError
-from app.models import Purchase, PurchaseStatus
-from app.schemas import PurchaseRequest, RefundRequest
-from app.services.purchases import confirm_purchase, reserve_tickets
+from app.models import Event, Purchase, PurchaseStatus, TicketType
+from app.schemas import PurchaseRequest
+from app.services.purchases import reserve_tickets
 from app.services.refunds import create_refund
-from tests.conftest import counters, ticket_type
-
-
-def refund_of(*pairs: tuple[int, int], reason: str | None = None) -> RefundRequest:
-    return RefundRequest(
-        items=[{"purchase_item_id": item_id, "quantity": qty} for item_id, qty in pairs], reason=reason
-    )
-
-
-@pytest.fixture
-def buy(db, settings):
-    """Reserve and confirm in one step: returns a completed purchase."""
-
-    def _buy(user, event, **quantities: int) -> Purchase:
-        request = PurchaseRequest(
-            items=[{"ticket_type_id": ticket_type(event, name).id, "quantity": qty} for name, qty in quantities.items()]
-        )
-        purchase, _ = reserve_tickets(db, user, event.id, request, settings)
-        return confirm_purchase(db, user, purchase.id)
-
-    return _buy
+from tests.conftest import counters, refund_of, ticket_type
 
 
 def item(purchase: Purchase, name: str):
@@ -239,3 +219,54 @@ def test_item_cannot_be_repeated_in_one_refund(db, user, make_event, settings, b
 
     with pytest.raises(InvalidPurchaseError):
         create_refund(db, user, purchase.id, refund_of((general_item.id, 1), (general_item.id, 1)), settings)
+
+
+# --- Idempotency and rounding --------------------------------------------------
+
+
+def test_retrying_a_refund_with_the_same_key_refunds_once(db, user, make_event, settings, buy):
+    event = make_event()
+    purchase = buy(user, event, General=4)
+    item_id = purchase.items[0].id
+
+    first, created = create_refund(db, user, purchase.id, refund_of((item_id, 1)), settings, "refund-key-1")
+    again, created_again = create_refund(db, user, purchase.id, refund_of((item_id, 1)), settings, "refund-key-1")
+
+    assert created and not created_again
+    assert again.id == first.id
+    db.refresh(purchase)
+    assert purchase.items[0].refunded_quantity == 1
+    assert counters(ticket_type(event, "General").id) == (0, 3)
+
+
+def test_a_different_key_is_a_different_refund(db, user, make_event, settings, buy):
+    event = make_event()
+    purchase = buy(user, event, General=4)
+    item_id = purchase.items[0].id
+
+    create_refund(db, user, purchase.id, refund_of((item_id, 1)), settings, "refund-key-1")
+    create_refund(db, user, purchase.id, refund_of((item_id, 1)), settings, "refund-key-2")
+
+    db.refresh(purchase)
+    assert purchase.items[0].refunded_quantity == 2
+
+
+def test_splitting_a_refund_pays_the_same_as_refunding_together(db, make_user, settings, buy):
+    event = Event(
+        name="Odd cents",
+        venue="Venue",
+        starts_at=datetime.now(UTC) + timedelta(days=4),  # 50% window
+        ticket_types=[TicketType(name="General", price=Decimal("25.25"), capacity=50)],
+    )
+    db.add(event)
+    db.commit()
+    splitter, bundler = make_user(), make_user()
+    split, together = buy(splitter, event, General=2), buy(bundler, event, General=2)
+
+    create_refund(db, splitter, split.id, refund_of((split.items[0].id, 1)), settings)
+    create_refund(db, splitter, split.id, refund_of((split.items[0].id, 1)), settings)
+    create_refund(db, bundler, together.id, refund_of((together.items[0].id, 2)), settings)
+
+    db.refresh(split)
+    db.refresh(together)
+    assert split.refunded_amount == together.refunded_amount == Decimal("25.26")  # 2 x 12.63

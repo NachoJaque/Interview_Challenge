@@ -1,11 +1,12 @@
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, Path, status
+from fastapi import Depends, Path
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.database import get_db
+from app.exceptions import ForbiddenError, NotAuthenticatedError
 from app.models import User
 from app.security import decode_access_token
 
@@ -26,11 +27,7 @@ def get_current_user(db: DbSession, token: Annotated[str, Depends(oauth2_scheme)
     user_id = decode_access_token(token)
     user = db.get(User, user_id) if user_id is not None else None
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise NotAuthenticatedError("Invalid or expired token.")
     return user
 
 
@@ -48,7 +45,7 @@ OptionalUser = Annotated[User | None, Depends(get_optional_user)]
 
 def get_current_admin(user: CurrentUser) -> User:
     if not user.is_admin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+        raise ForbiddenError("Admin privileges required.")
     return user
 
 

@@ -14,3 +14,6 @@ MANUAL.en.md
 # Phone copies of the manuals
 MANUAL.pdf
 MANUAL.en.pdf
+
+# Database dumps written by scripts/backup.sh
+backups/

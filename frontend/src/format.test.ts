@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { errorMessage } from "./api";
 import { clock, money, refundPerTicket, timeUntil } from "./format";
+import { nextPollDelay } from "./hooks";
 
 describe("refundPerTicket", () => {
   it("pays the full price at 100%", () => {
@@ -52,12 +53,41 @@ describe("errorMessage", () => {
     expect(errorMessage(429, null).message).toMatch(/Too many attempts/);
   });
 
-  it("names the field of a validation error", () => {
-    const body = { detail: [{ loc: ["body", "password"], msg: "too short" }] };
-    expect(errorMessage(422, body).message).toBe("password: too short");
+  it("reads validation errors from the same shape", () => {
+    const body = { error: { code: "validation_error", message: "password: too short", details: [] } };
+    expect(errorMessage(422, body)).toEqual({ message: "password: too short", code: "validation_error" });
   });
 
   it("falls back to a generic message", () => {
     expect(errorMessage(500, "<html>").message).toBe("Something went wrong. Please try again.");
+  });
+});
+
+describe("errorMessage for an overloaded site", () => {
+  it("explains a 503 that has no JSON body", () => {
+    expect(errorMessage(503, null)).toEqual({
+      message: "The site is very busy right now. Please try again in a few seconds.",
+      code: "service_busy",
+    });
+  });
+
+  it("still prefers the API's own message", () => {
+    const body = { error: { code: "service_busy", message: "Please try again in a few seconds." } };
+    expect(errorMessage(503, body).message).toBe("Please try again in a few seconds.");
+  });
+});
+
+describe("nextPollDelay", () => {
+  it("keeps the normal pace while requests succeed", () => {
+    expect(nextPollDelay(3000, 0, 0)).toBe(3000);
+  });
+
+  it("doubles the wait after each failure, up to a ceiling", () => {
+    expect([1, 2, 3].map((failures) => nextPollDelay(3000, failures, 0))).toEqual([6000, 12000, 24000]);
+    expect(nextPollDelay(3000, 10, 0)).toBe(30000);
+  });
+
+  it("spreads clients out by up to 20%", () => {
+    expect(nextPollDelay(3000, 0, 1)).toBe(3600);
   });
 });

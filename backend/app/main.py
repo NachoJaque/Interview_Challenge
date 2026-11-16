@@ -4,17 +4,19 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 
+from anyio import to_thread
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
+from app.admission import AdmissionMiddleware
 from app.audit import request_id_var
 from app.config import get_settings
 from app.database import SessionLocal
 from app.deps import DbSession
-from app.exceptions import DomainError, domain_error_handler
+from app.exceptions import register_error_handlers
 from app.routers import auth, events, purchases
 from app.services.purchases import release_expired_purchases
 
@@ -45,6 +47,9 @@ async def _reservation_sweeper(interval_seconds: int) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # One thread per request in progress is enough: a request uses one at a time.
+    to_thread.current_default_thread_limiter().total_tokens = settings.db_pool_size + settings.db_max_overflow
+
     sweeper = None
     if settings.reservation_sweep_seconds > 0:
         sweeper = asyncio.create_task(_reservation_sweeper(settings.reservation_sweep_seconds))
@@ -73,17 +78,21 @@ if settings.cors_origins:
     )
 
 
+# Added first, so it sits innermost: a request waiting for a place has
+# already been tagged and will carry the security headers either way.
+app.add_middleware(
+    AdmissionMiddleware,
+    limit=settings.db_pool_size,
+    max_wait_seconds=settings.request_queue_timeout_seconds,
+    exempt_paths=frozenset({"/health"}),
+)
+
+Handler = Callable[[Request], Awaitable[Response]]
+
+
 @app.middleware("http")
-async def request_context(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
-    """Tag the request with an id (always generated here, never taken from the
-    client) and add the security headers to its response."""
-    request_id = uuid.uuid4().hex
-    token = request_id_var.set(request_id)
-    try:
-        response = await call_next(request)
-    finally:
-        request_id_var.reset(token)
-    response.headers["X-Request-ID"] = request_id
+async def add_security_headers(request: Request, call_next: Handler) -> Response:
+    response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -94,7 +103,21 @@ async def request_context(request: Request, call_next: Callable[[Request], Await
     return response
 
 
-app.add_exception_handler(DomainError, domain_error_handler)
+@app.middleware("http")
+async def tag_request(request: Request, call_next: Handler) -> Response:
+    """Give the request an id (always generated here, never taken from the
+    client), visible to the audit log while it runs and returned to the caller."""
+    request_id = uuid.uuid4().hex
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+register_error_handlers(app)
 
 app.include_router(auth.router)
 app.include_router(events.router)

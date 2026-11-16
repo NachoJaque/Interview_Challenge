@@ -1,41 +1,17 @@
 """Race conditions, exercised with real threads and one database session per
 thread, the same way concurrent HTTP requests hit the service layer."""
 
-from collections import Counter
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
-from threading import Barrier
 
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.exceptions import DomainError
 from app.models import Purchase, PurchaseStatus, User
 from app.schemas import PurchaseRequest, RefundRequest
 from app.services.purchases import confirm_purchase, release_expired_purchases, reserve_tickets
 from app.services.refunds import create_refund
-from tests.conftest import counters, ticket_type
-
-
-def run_concurrently(tasks: list[Callable[[Session], object]]) -> Counter[str]:
-    """Run every task at the same instant, each in its own session.
-
-    Returns how many succeeded ("ok") and how many failed, by error code.
-    """
-    barrier = Barrier(len(tasks))
-
-    def run(task: Callable[[Session], object]) -> str:
-        with SessionLocal() as session:
-            barrier.wait()
-            try:
-                task(session)
-                return "ok"
-            except DomainError as exc:
-                return exc.code
-
-    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-        return Counter(pool.map(run, tasks))
+from tests.conftest import counters, refund_of, run_concurrently, ticket_type
 
 
 def buy_one(user_id: int, event_id: int, ticket_type_id: int, settings) -> Callable[[Session], object]:
@@ -180,3 +156,21 @@ def test_sweepers_running_in_parallel_release_each_reservation_once(db, make_use
     run_concurrently([lambda session: release_expired_purchases(session)] * 6)
 
     assert counters(general.id) == (0, 0)  # a double release would violate held >= 0
+
+
+def test_concurrent_retries_of_one_refund_refund_once(db, user, make_event, settings, buy):
+    event = make_event()
+    purchase = buy(user, event, General=5)
+    request = refund_of((purchase.items[0].id, 1))
+
+    outcomes = run_concurrently(
+        [
+            lambda session: create_refund(
+                session, session.get(User, user.id), purchase.id, request, settings, "same-refund-key"
+            )
+        ]
+        * 8
+    )
+
+    assert outcomes == {"ok": 8}
+    assert counters(ticket_type(event, "General").id) == (0, 4)

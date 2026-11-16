@@ -7,9 +7,12 @@ created automatically and is separate from the development data.
 """
 
 import os
+from collections import Counter
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from threading import Barrier
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+psycopg://krunchbox:krunchbox@127.0.0.1:5432/krunchbox_test"
@@ -18,6 +21,7 @@ TEST_DATABASE_URL = os.environ.get(
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
 os.environ["RESERVATION_SWEEP_SECONDS"] = "0"  # tests trigger the sweeper explicitly
 os.environ["ENVIRONMENT"] = "test"
+os.environ["EVENTS_CACHE_SECONDS"] = "0"  # tests read events right after changing them
 os.environ["CORS_ORIGINS"] = '["http://localhost:5173"]'  # off by default; on to test the allow-list
 
 import pytest  # noqa: E402
@@ -28,9 +32,12 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 from app.config import Settings, get_settings  # noqa: E402
 from app.database import Base, SessionLocal, engine  # noqa: E402
+from app.exceptions import DomainError  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Event, TicketType, User  # noqa: E402
+from app.models import Event, Purchase, TicketType, User  # noqa: E402
+from app.schemas import PurchaseRequest, RefundRequest  # noqa: E402
 from app.security import create_access_token, hash_password  # noqa: E402
+from app.services.purchases import confirm_purchase, reserve_tickets  # noqa: E402
 
 # Hashing is deliberately slow; hash the shared test password once.
 TEST_PASSWORD = "test-password-123"
@@ -128,6 +135,53 @@ def make_event(db: Session) -> Callable[..., Event]:
         return event
 
     return _make
+
+
+@pytest.fixture
+def buy(db: Session, settings: Settings) -> Callable[..., Purchase]:
+    """Reserve and confirm in one step: `buy(user, event, General=2, VIP=1)` returns a completed purchase."""
+
+    def _buy(user: User, event: Event, **quantities: int) -> Purchase:
+        request = request_for(*((ticket_type(event, name).id, quantity) for name, quantity in quantities.items()))
+        purchase, _ = reserve_tickets(db, user, event.id, request, settings)
+        return confirm_purchase(db, user, purchase.id)
+
+    return _buy
+
+
+# --- Helpers shared by the test modules -------------------------------------------
+
+
+def request_for(*pairs: tuple[int, int]) -> PurchaseRequest:
+    """A purchase request from (ticket_type_id, quantity) pairs."""
+    return PurchaseRequest(items=[{"ticket_type_id": tt_id, "quantity": qty} for tt_id, qty in pairs])
+
+
+def refund_of(*pairs: tuple[int, int], reason: str | None = None) -> RefundRequest:
+    """A refund request from (purchase_item_id, quantity) pairs."""
+    return RefundRequest(
+        items=[{"purchase_item_id": item_id, "quantity": qty} for item_id, qty in pairs], reason=reason
+    )
+
+
+def run_concurrently(tasks: list[Callable[[Session], object]]) -> Counter[str]:
+    """Run every task at the same instant, each in its own session.
+
+    Returns how many succeeded ("ok") and how many failed, by error code.
+    """
+    barrier = Barrier(len(tasks))
+
+    def run(task: Callable[[Session], object]) -> str:
+        with SessionLocal() as session:
+            barrier.wait()
+            try:
+                task(session)
+                return "ok"
+            except DomainError as exc:
+                return exc.code
+
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        return Counter(pool.map(run, tasks))
 
 
 def auth_headers(user: User) -> dict[str, str]:

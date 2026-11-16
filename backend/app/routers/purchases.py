@@ -12,6 +12,7 @@ from app.schemas import (
     PurchaseItemRead,
     PurchaseRead,
     PurchaseRequest,
+    PurchaseRulesRead,
     RefundPolicyRead,
     RefundRead,
     RefundRequest,
@@ -66,6 +67,16 @@ def _to_read(purchase: Purchase, settings: Settings) -> PurchaseRead:
         ],
         refunds=[RefundRead.model_validate(refund) for refund in purchase.refunds],
         refund_policy=RefundPolicyRead.model_validate(refund_service.current_refund_policy(purchase, settings)),
+    )
+
+
+@router.get("/purchase-rules", response_model=PurchaseRulesRead)
+def get_purchase_rules(settings: AppSettings) -> PurchaseRulesRead:
+    """The purchase limits currently in force."""
+    return PurchaseRulesRead(
+        max_tickets_per_purchase=settings.max_tickets_per_purchase,
+        max_tickets_per_user_per_event=settings.max_tickets_per_user_per_event,
+        reservation_ttl_minutes=settings.reservation_ttl_minutes,
     )
 
 

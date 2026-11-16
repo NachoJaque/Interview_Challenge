@@ -4,10 +4,8 @@ import { api, type EventSummary } from "../api";
 import { useAuth } from "../auth";
 import { AvailabilityBar, ErrorBanner, PendingCheckout, Stepper } from "../components";
 import { formatDate, money, timeUntil } from "../format";
-import { usePolling } from "../hooks";
+import { usePolling, usePurchaseRules } from "../hooks";
 import { REFRESH_MS } from "./EventsPage";
-
-const MAX_TICKETS_PER_PURCHASE = 10; // mirrors the API rule; the API is the one that enforces it
 
 export function EventPage() {
   const eventId = Number(useParams().eventId);
@@ -16,6 +14,7 @@ export function EventPage() {
 
   const event = usePolling(() => api.event(eventId), REFRESH_MS);
   const purchases = usePolling(api.purchases, REFRESH_MS, user !== null);
+  const rules = usePurchaseRules();
 
   const [quantities, setQuantities] = useState<Record<number, number>>({});
   const [busy, setBusy] = useState(false);
@@ -95,7 +94,9 @@ export function EventPage() {
           <ul className="ticket-list">
             {event.data.ticket_types.map((tt) => {
               const quantity = quantities[tt.id] ?? 0;
-              const roomInPurchase = MAX_TICKETS_PER_PURCHASE - (totalQuantity - quantity);
+              // Until the rules load, only availability limits the steppers; the API still enforces them.
+              const perPurchase = rules?.max_tickets_per_purchase ?? Infinity;
+              const roomInPurchase = perPurchase - (totalQuantity - quantity);
               return (
                 <li key={tt.id}>
                   <div className="ticket-row">
@@ -138,10 +139,13 @@ export function EventPage() {
               </Link>
             )}
           </div>
-          <p className="muted small">
-            Up to {MAX_TICKETS_PER_PURCHASE} tickets per purchase and 20 per customer for each event. Reserving holds your tickets for a few minutes
-            while you confirm.
-          </p>
+          {rules && (
+            <p className="muted small">
+              Up to {rules.max_tickets_per_purchase} tickets per purchase and {rules.max_tickets_per_user_per_event} per
+              customer for each event. Reserving holds your tickets for {rules.reservation_ttl_minutes} minutes while
+              you confirm.
+            </p>
+          )}
         </section>
       )}
 
